@@ -31,7 +31,17 @@ int trace_bio(struct pt_regs *ctx, struct bio *bio) {
 """
 
 b = BPF(text=bpf_text)
-b.attach_kprobe(event="blk_mq_submit_bio", fn_name="trace_bio")
+# Auto-detect block I/O function: 5.9+/5.8/<5.8
+bio_func = None
+for func in ["blk_mq_submit_bio", "submit_bio_noacct", "generic_make_request"]:
+    if BPF.ksymname(func) != -1:
+        bio_func = func
+        break
+if not bio_func:
+    print("Error: no supported block I/O function found.")
+    exit(1)
+print(f"Attached to {bio_func}")
+b.attach_kprobe(event=bio_func, fn_name="trace_bio")
 
 print("%-18s %-6s %-16s %-4s %-14s %s" %
       ("TIMESTAMP", "PID", "COMM", "R/W", "SECTOR", "BYTES"))
