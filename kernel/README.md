@@ -90,41 +90,60 @@ cat /sys/kernel/debug/samon/stats
 
 ## 검증 상태
 
-검증 상태를 근거별로 구분해서 적는다. "검증됨"은 실제 실행 결과가 있는 항목만 해당한다.
+"검증됨"은 실제 커널에서 실행한 결과가 있는 항목만 해당한다.
 
-### 검증됨 (2026-09-22 실제 커널 실행, 이전 버전 코드 기준)
-근거는 cap2/session-log-2026-09-22.txt이다.
+### 검증됨 (2026-10-05, 커널 6.8.0-SAMON #8, verify_samon.sh 실행 결과 PASS 7 / FAIL 0)
+
+환경: VMware VM, ext4(/dev/sda2, 파티션 시작 섹터 4096, 블록 4096바이트), 디렉터리 /var/tmp/samon_verify.
 
 | 항목 | 방식 | 결과 |
 |---|---|---|
-| tracepoint 등록 | kdamond를 saddr로 켠 뒤 lba_page_map 확인 | 엔트리 생성됨 |
-| buffered write 관측 | fio --direct=0 4MB write 후 sync, debugfs 조회 | lba, pfn 기록 확인 |
-| read/write 카운터 분리 | debugfs의 reads, writes 열 확인 | 분리되어 동작 |
-| hot 판정 | dd oflag=sync 15회 반복 후 hot_w 확인 | writes=15, hot_w=1 |
+| tracepoint 등록 및 stats 노출 | kdamond를 saddr로 켠 뒤 stats 파일 확인 | 정상 |
+| LBA와 파일 물리 위치 일치 | fio --direct=0 4MB write 후 sync. filefrag -e의 physical 블록을 (블록 크기 / 512)배하고 파티션 시작 섹터를 더해 섹터로 변환하여 lba_page_map과 비교 | 파일의 블록 시작 섹터 1024개 중 1024개 모두 존재 |
+| direct I/O 배제 | fio --direct=1 4MB write 후 sync. 해당 파일의 섹터 집합과 lba_page_map의 교집합 계산, stats의 skip 카운터 증가량 확인 | 교집합 0개, skip 카운터 +1024 (4MB / 4KB와 일치) |
+| hot 판정 | threshold(10) 이상 dd oflag=sync로 같은 위치에 반복 write 후 hot_w 확인 | hot_w=1 엔트리 확인 |
+| 윈도우 리셋 | 윈도우(1000ms) 경과 후 한 번 더 write, 같은 LBA의 writes 값 확인 | writes=1로 리셋됨 |
+| read/write 카운터 분리 | 2026-09-22 세션 로그(이전 버전) 및 이번 실행의 reads/writes 열 | 분리 동작 |
+| 부팅 및 모듈 로드 | 6.8.0-SAMON #8로 부팅, 부팅 로그에서 saddr ops 등록 확인 | 정상 |
 
-### 이번 수정분 상태
+실행 직후 stats:
+
+```
+rq_seen=1406  seg_buffered=6164
+skip_null=0  skip_anon=1024  skip_nomap=8  skip_pinned=0
+drop_full=0  drop_nomem=0   entries=6120 (max 65536)
+```
+
+해석 시 주의할 점은 다음과 같다.
+
+- direct I/O 4MB write가 건너뛴 1024개 segment는 모두 skip_anon으로 분류되었다. 사용자 anon 버퍼를 쓰는 일반적인 direct I/O 경로는 검증되었다.
+- skip_pinned 경로(mmap한 파일 버퍼를 쓰는 direct I/O)는 이번 시험에서 한 번도 실행되지 않았다. 해당 경로는 코드만 있고 검증되지 않았다.
+- direct 시험 중 seg_buffered가 63 늘었다. 시스템 전체를 관측하므로 백그라운드 buffered I/O가 섞인 것이며, 그래서 검증은 총 개수가 아니라 특정 파일의 섹터 집합으로 비교한다.
+- skip_nomap=8은 page cache 매핑이 없는 segment이다. 어떤 I/O인지는 분류하지 않았다.
+- 각 항목은 1회 실행 결과이다. 반복 실행, 다른 파일시스템, 다른 워크로드에서의 재현은 확인하지 않았다.
+
+### 검증되지 않은 항목
+
 | 항목 | 상태 |
 |---|---|
-| 새 saddr.c 컴파일 | 확인됨. 6.8 소스 트리에서 make mm/damon/saddr.o W=1, 경고 및 에러 없음 |
-| 새 saddr.c 런타임 동작 | 미검증. 이 작업 환경에서 sudo와 재부팅이 불가능하여 새 커널을 올려 실행하지 못했다 |
-
-### 아직 검증되지 않은 항목 (verify_samon.sh로 검증 예정)
-이전 세션에서 "코드 로직상 정확함"으로만 넘어갔거나 근거가 부족했던 항목이다.
-
-| 항목 | 검증 방식 | 통과 기준 |
-|---|---|---|
-| direct I/O 배제 | 같은 크기의 buffered 파일과 direct 파일(fio --direct=1)을 쓴다. filefrag로 direct 파일의 물리 섹터 집합을 구해 lba_page_map과 교집합을 계산한다. 추가로 stats의 skip 카운터 증가를 확인한다 | 교집합이 0이고 skip 카운터가 증가 |
-| LBA와 파일 물리 위치 일치 | filefrag -e의 physical 블록에 (파일시스템 블록 크기 / 512)를 곱하고 파티션 시작 섹터(/sys/class/block/<part>/start)를 더해 섹터로 변환한 뒤 lba_page_map과 비교한다 | buffered 파일의 모든 블록 시작 섹터가 존재 |
-| hot 전환 및 윈도우 리셋 | threshold 이상 반복 write 후 hot_w=1 확인, 윈도우 경과 후 한 번 더 write하여 카운터가 threshold 미만으로 돌아가는지 확인 | 두 조건 모두 충족 |
-| 부하 및 에러 경로 | fio 병렬 I/O에서 오버헤드 측정, loop device와 dmsetup 에러 주입 | 미구현 (후속 작업) |
-
-이전 세션에서 filefrag와 LBA 정밀 대조가 되지 않은 원인은 단위 변환 때문으로 보인다. filefrag의 physical은 파일시스템 블록 단위이고 파티션 시작 오프셋이 포함되지 않지만, bio의 섹터는 디스크 전체 기준 512바이트 단위이다. verify_samon.sh는 이 변환을 적용한다.
+| skip_pinned 경로 (mmap 파일 버퍼를 쓰는 direct I/O) | 미실행 |
+| 고부하(fio 병렬)에서의 락 경합과 오버헤드 | 미측정 |
+| 에러 주입(completion error) 경로 | 미실행 |
+| 동시성 안전성(장시간, 다중 CPU) | 미검증 |
+| 옵션 B의 실제 효과(evict 스캔에서 skip되는지) | 미측정. 호출만 하며 효과는 확인하지 않음 |
 
 ### 검증 실행 방법
 ```bash
 sudo bash verify_samon.sh /var/tmp/samon_verify
 ```
 tmpfs가 아닌 실제 디스크 위의 디렉터리를 지정해야 한다. 결과는 PASS/FAIL로 출력된다.
+
+## 빌드 시 주의 (6.8.0-SAMON 커널)
+
+- 이 커널은 CONFIG_DEBUG_INFO_BTF_MODULES=y이다. saddr.c를 고쳐 vmlinux만 다시 빌드하면 모듈의 BTF와 vmlinux의 BTF가 어긋나, CONFIG_MODULE_ALLOW_BTF_MISMATCH가 꺼져 있을 때 모듈 로드가 거부된다. 디스크 드라이버(mptspi 등)가 모듈이면 initramfs에서 루트 디스크를 찾지 못해 부팅이 실패한다.
+- 이 때문에 .config에 CONFIG_MODULE_ALLOW_BTF_MISMATCH=y를 설정했다. 부팅 로그에 BTF mismatch 경고가 한 번 출력되는 것은 정상이다.
+- vmlinux 링크 단계의 BTF 생성(pahole)은 약 4.7GB 메모리를 쓴다. 메모리 4GB VM에서는 OOM으로 빌드가 실패하거나 VM이 멈췄다. 8GB에서는 성공했고 빌드 중 전체 사용량 최대는 약 7GB였다. 병렬 옵션(-j)을 빼려면 make에 PAHOLE_FLAGS를 지정한다.
+- modules_install은 INSTALL_MOD_STRIP=1로 하면 모듈과 initrd 크기가 줄어든다.
 
 ## 알려진 한계
 
