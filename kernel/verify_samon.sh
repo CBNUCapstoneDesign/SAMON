@@ -128,20 +128,25 @@ RD=$(( $(st_get rq_seen) - R0 ))
 echo 0 > $PARM/samon_dev_major; echo 0 > $PARM/samon_dev_minor
 
 # 7. kdamond off/on cycling: tree freed, probe not duplicated, no kernel warnings
-DM0=$(dmesg | wc -l); FIRST=""; LAST=""; LEAK=0
+# Duplicate-probe check: a block written once must show writes=1 in the map.
+# (A second registered probe would count the same completion twice -> writes=2.)
+DM0=$(dmesg | wc -l); LEAK=0; MAXW=0; NOHIT=0
 for c in $(seq 1 10); do
   echo off > $KD/0/state; wait_state off || { bad "kdamond did not stop (cycle $c)"; break; }
   E=$(awk -F'[= ]' '/^entries=/{print $2}' $DBG/stats)
   [ "$E" -eq 0 ] || { LEAK=1; echo "cycle $c: entries=$E after off"; }
   echo on > $KD/0/state; wait_state on || { bad "kdamond did not restart (cycle $c)"; break; }
-  G0=$(st_get seg_buffered)
+  rm -f $DIR/cyc; sync
   dd if=/dev/zero of=$DIR/cyc bs=4k count=1024 conv=fsync status=none; sync; sleep 0.5
-  D=$(( $(st_get seg_buffered) - G0 ))
-  [ -z "$FIRST" ] && FIRST=$D; LAST=$D
+  file_sectors $DIR/cyc | sort -u > /tmp/samon_cyc.sec
+  W=$(awk 'NR==FNR{s[$1]=1;next} /^lba=/{split($1,a,"=");if(a[2] in s){for(i=1;i<=NF;i++)if($i~/^writes=/){split($i,b,"=");if(b[2]>m)m=b[2];n++}}} END{print m+0, n+0}' /tmp/samon_cyc.sec $DBG/lba_page_map)
+  CW=${W% *}; CN=${W#* }
+  [ "$CW" -gt "$MAXW" ] && MAXW=$CW
+  [ "$CN" -gt 0 ] || NOHIT=1
 done
-echo "cycle test: seg_buffered delta first=$FIRST last=$LAST (10 off/on cycles)"
+echo "cycle test: max writes per file LBA over 10 off/on cycles = $MAXW"
 [ "$LEAK" -eq 0 ] && ok "rbtree emptied on every kdamond stop" || bad "entries left after stop"
-[ -n "$FIRST" ] && [ "$LAST" -le $((FIRST*2+200)) ] && ok "per-I/O count stable across cycles (probe not duplicated)" || bad "count grew across cycles"
+[ "$NOHIT" -eq 0 ] && [ "$MAXW" -eq 1 ] && ok "each block counted once after repeated restarts (probe not duplicated)" || bad "writes per block = $MAXW (hit-missing=$NOHIT)"
 NEWWARN=$(dmesg | tail -n +$((DM0+1)) | grep -ciE 'BUG:|WARNING:|Oops|KASAN|lockdep|RCU stall|soft lockup')
 [ "$NEWWARN" -eq 0 ] && ok "no kernel warnings during tests" || bad "kernel warnings in dmesg ($NEWWARN)"
 

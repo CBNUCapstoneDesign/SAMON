@@ -128,16 +128,21 @@ drop_full=0  drop_nomem=0   entries=6120 (max 65536)
 - skip_nomap=8은 page cache 매핑이 없는 segment이다. 어떤 I/O인지는 분류하지 않았다.
 - 각 항목은 1회 실행 결과이다. 반복 실행, 다른 파일시스템, 다른 워크로드에서의 재현은 확인하지 않았다.
 
-### 코드는 반영되었으나 아직 실행 검증하지 않은 항목 (verify_samon.sh 섹션 4~7에 포함)
+### 추가 검증 결과 (2026-10-05, 커널 6.8.0-SAMON #9, verify_samon.sh PASS 16 / FAIL 0)
 
-| 항목 | 검증 방식 | 통과 기준 |
-|---|---|---|
-| skip_pinned 경로 | test_pinned로 1MiB를 mmap 소스 O_DIRECT write 후 skip_pinned 증가량 확인, 대상 파일 섹터가 lba_page_map에 없는지 확인 | skip_pinned가 230 이상 증가, 섹터 0개 |
-| 옵션 B 토글 | samon_opt_b를 0과 1로 바꿔 각각 hot write 반복, mark_accessed 증가량 비교 | 0이면 증가 0, 1이면 증가 |
-| 대상 디스크 필터 | 존재하지 않는 디스크로 필터 후 I/O(rq_seen 증가 없음, skip_dev 증가), 실제 디스크로 필터 후 I/O(rq_seen 증가) | 두 조건 충족 |
-| kdamond off/on 10회 반복 | 매번 stop 후 entries가 0인지, 같은 I/O의 seg_buffered 증가량이 회차 간 유지되는지(probe 중복 등록 없음), dmesg에 BUG/WARNING/Oops/lockdep 없는지 | 모두 충족 |
+| 항목 | 결과 |
+|---|---|
+| skip_pinned 경로 | test_pinned(mmap 소스 O_DIRECT 1MiB) 후 skip_pinned +256(= 256 페이지와 일치), 대상 파일 섹터는 맵에 0개 |
+| 옵션 B 토글 | samon_opt_b=0이면 mark_accessed +0, 1이면 +6 |
+| 대상 디스크 필터 | 존재하지 않는 디스크로 지정: rq_seen +0, skip_dev +705. 실제 디스크(sda 8:0)로 지정: 관측됨 |
+| kdamond off/on 10회 | 매 stop마다 entries=0 확인, 커널 경고(BUG/WARNING/Oops/lockdep/RCU stall/soft lockup) 없음 |
+| 부분 완료 경로 | budget_cut=0 이므로 이 경로는 한 번도 실행되지 않았다. 코드는 반영됐지만 동작은 검증되지 않았다 |
 
-참고: 옵션 B 토글 시험은 백그라운드의 같은 LBA 반복 write(예: 파일시스템 저널)가 mark_accessed를 호출하면 off 항목이 오탐 FAIL이 될 수 있다. FAIL 시 재실행하여 확인한다.
+이 실행에서 검증력이 약했던 항목과 미해결 관찰:
+
+- "probe 중복 등록 없음" 판정은 seg_buffered 증가량(첫 회 1044, 마지막 회 2216)을 비교하는 방식이었는데, 배경 I/O가 섞여 중복 등록을 구분하지 못한다. 이 판정은 검증된 것으로 보지 않는다. verify_samon.sh를 쓴 파일의 LBA별 writes 값(한 번 쓴 블록은 1이어야 함)으로 판정하도록 수정했으며, 수정본으로 다시 실행하기 전까지는 미검증이다.
+- skip_nomap이 35686으로, 이전 실행(8)보다 크게 늘었다. address_space가 없는 segment가 대량 발생했다는 뜻이며, 어떤 I/O인지(저널 등 파일시스템 내부 I/O로 추정되나 확인하지 않음) 분류하지 않았다.
+- 옵션 B 시험은 hot write 반복 파일 1개씩의 결과이고, 실행 간 mark_accessed 값(+6)은 워크로드에 따라 달라진다.
 
 ### 검증되지 않은 항목
 
