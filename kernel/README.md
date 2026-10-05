@@ -4,7 +4,7 @@ Linux 커널 6.8의 DAMON operations set으로 구현한 스토리지(블록 디
 
 eBPF 기반 유저스페이스 스크립트(samon_probe.py, samon_monitor.py 등)는 이 구현의 기반이 아니다. 이 디렉터리의 코드는 모두 커널 내부(mm/damon/saddr.c)에서 동작한다.
 
-## 현재 구현 범위 한눈에 보기
+## 현재 구현 범위
 
 | 구분 | 상태 |
 |---|---|
@@ -196,7 +196,7 @@ tmpfs가 아닌 실제 디스크 위의 디렉터리를 지정해야 한다. 마
 - saddr는 빌트인이라 수정 후 재부팅이 필요하다. 모듈 트리(/lib/modules/6.8.0-SAMON)가 이미 완전하면 modules_install은 다시 할 필요가 없다. modules_install을 할 때는 INSTALL_MOD_STRIP=1을 쓰면 모듈과 initrd 크기가 줄어든다.
 - 설치 전에 bzImage의 빌드 번호, vmlinux의 .BTF 섹션 존재, 빌드 로그에 Killed/Error가 없음을 확인한다.
 
-## 알려진 한계
+## 한계
 
 - 시스템 전체의 buffered I/O를 관측한다. 대상 디스크 필터로 좁힐 수 있다.
 - 이 방식은 디스크 I/O가 발생한 page만 볼 수 있다. 캐시 히트인 page는 I/O가 없어 관측되지 않으므로, 캐시에 남아 있는 page를 대상으로 한 정책(오래 안 쓰인 page를 evict 우선 등)은 이 방식으로 구현할 수 없다.
@@ -225,4 +225,4 @@ tmpfs가 아닌 실제 디스크 위의 디렉터리를 지정해야 한다. 마
 
 ## 범위 밖 (후순위)
 
-점수 등급 체계(+++, ++, --, ---), DAMOS scheme 연동, DAMON/SAMON 통합 비교 실험은 구현하지 않았다. 사용자가 명시적으로 지시하기 전까지 착수하지 않는다.
+점수 등급 체계(+++, ++, --, ---), DAMOS scheme 연동, DAMON/SAMON 통합 비교 실험은 구현하지 않았다.
