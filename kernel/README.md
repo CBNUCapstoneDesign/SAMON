@@ -176,14 +176,16 @@ tmpfs가 아닌 실제 디스크 위의 디렉터리를 지정해야 한다. 마
 | 2026-10-05 | #8 | verify_samon.sh 7개 항목 PASS |
 | 2026-10-05 | #9 | 16개 항목 PASS (skip_pinned, 옵션 B 토글, 디스크 필터, kdamond 반복, probe 중복 검사 포함) |
 | 2026-10-05 | #10 | nomap 분류 합 일치 PASS. nomap_meta 가설은 기각. 총 17 PASS |
+| 2026-10-05 | #10 | 하네스 실행 직후 재실행에서 3개 FAIL (LBA 일치, 윈도우 리셋, 옵션 B). 원인은 코드가 아니라 트리 포화(drop_full 약 1332만)였으며, 검증이 빈 트리에서 시작하도록 스크립트를 고친 뒤 재실행하여 19개 모두 PASS (빈 트리 재시작, 포화 없음 확인 항목 포함) |
 
 ## 측정 하네스 (bench/, 준비됨, 아직 커널에서 실행하지 않음)
 
-옵션 B 효과와 오버헤드를 같은 도구로 비교한다. samon_bench.sh는 구성 4개를 반복 실행한다: off(kdamond 정지, probe 없음), off2(두 번째 기준선, 실행 간 잡음 추정용), on_noB(samon_opt_b=0), on_B(samon_opt_b=1). 구성은 매 반복마다 섞어서 실행하고, 매번 cgroup v2 memory.max(기본 768M)와 drop_caches로 시작한다. 워크로드는 zipf 랜덤 read/write(hot, 2잡, fdatasync 32회마다)와 큰 파일 순차 read(scan)를 동시에 돌리며 hot 잡의 IOPS와 p99 지연을 보고한다. 실행 전후로 /proc/vmstat(refault, activate, steal, scan 등)와 saddr stats의 차분을 CSV에 기록하고, summarize.py가 구성별 평균과 표준편차, off 대비 차이, off 대 off2 차이(잡음)를 표로 만든다.
+옵션 B 효과와 오버헤드를 같은 도구로 비교한다. on 구성은 실행마다 kdamond를 재시작해 빈 LBA 트리에서 시작하고, 실행 동안 samon_max_entries를 2097152로 올린다(데이터셋이 약 78만 개의 4KB LBA라 기본 상한 65536으로는 실행 중에 포화된다). 포화(drop_full 증가)가 나면 경고를 출력하고 CSV에도 기록한다. 전역 vmstat의 pgscan/pgsteal(kswapd, direct)은 cgroup 한도에 의한 회수를 세지 않으므로 cgroup의 memory.stat 값(pgscan, pgsteal, pgactivate, workingset_refault 등)도 함께 기록한다. samon_bench.sh는 구성 4개를 반복 실행한다: off(kdamond 정지, probe 없음), off2(두 번째 기준선, 실행 간 잡음 추정용), on_noB(samon_opt_b=0), on_B(samon_opt_b=1). 구성은 매 반복마다 섞어서 실행하고, 매번 cgroup v2 memory.max(기본 768M)와 drop_caches로 시작한다. 워크로드는 zipf 랜덤 read/write(hot, 2잡, fdatasync 32회마다)와 큰 파일 순차 read(scan)를 동시에 돌리며 hot 잡의 IOPS와 p99 지연을 보고한다. 실행 전후로 /proc/vmstat(refault, activate, steal, scan 등)와 saddr stats의 차분을 CSV에 기록하고, summarize.py가 구성별 평균과 표준편차, off 대비 차이, off 대 off2 차이(잡음)를 표로 만든다.
 
 - 실행: sudo bash bench/samon_bench.sh -d /var/tmp/samon_bench -n 5
 - 검증된 것: 스크립트 문법, fio 잡 정의에서 hot과 scan이 별도로 보고되는 것(드라이런), summarize.py의 계산(합성 데이터). 드라이런(-D)은 cgroup, kdamond, 모듈 파라미터를 건드리지 않으며 수치는 의미가 없다.
-- 검증되지 않은 것: 실제 SAMON 커널에서의 실행, 메모리 압박 설정의 적절성(워킹셋 대비 한도), 반복 횟수 5의 충분성. summarize.py의 판정 규칙은 대략적 선별 기준이며 유의성 검정이 아니다.
+- 첫 실행(20초 x 2회, 2026-10-05)은 동작 확인용이었다. 구성 간 차이는 같은 구성끼리의 흔들림(약 8%) 안이었고, 이 실행은 실행 간 트리 상태가 이어지고 실행 중 트리가 포화되었을 가능성이 있어(당시 drop_full을 기록하지 않았다) 효과나 오버헤드에 대한 결론으로 쓰지 않는다. 관찰로만 남긴다: mark_accessed가 실행당 수만~십수만 회 호출되었으나 전역 pgactivate는 23~25로 거의 변하지 않았다(원인 미확인). 위 수정(트리 재시작, 상한 상향, 포화 경고, 반복 3회 미만이면 판정 안 함) 이후의 재실행은 아직 하지 않았다.
+- 검증되지 않은 것: 수정된 하네스의 실제 실행, 메모리 압박 설정의 적절성(워킹셋 대비 한도), 반복 횟수 5의 충분성. summarize.py의 판정 규칙은 대략적 선별 기준이며 유의성 검정이 아니다.
 - pgbench는 이 VM에 설치되어 있지 않아 첫 하네스는 fio 기반이다.
 
 ## 빌드 시 주의 (6.8.0-SAMON 커널)
@@ -202,6 +204,7 @@ tmpfs가 아닌 실제 디스크 위의 디렉터리를 지정해야 한다. 마
 - debugfs 출력은 트리 순회 동안 spinlock을 잡는다. samon_max_entries로 상한을 두었지만 엔트리가 매우 많으면 조회 중 지연이 생길 수 있다.
 - 콜백에서 segment마다 전역 spinlock을 잡는다. 고부하에서의 오버헤드는 아직 측정하지 않았다.
 - 옵션 A/B/C 중 B를 기본 적용했으나, 확정은 사용자 결정 사항이다.
+- 엔트리가 만료되지 않는다. 트리가 samon_max_entries에 도달하면 이후 새 LBA는 기록되지 않고(drop_full 증가) kdamond를 껐다 켜서 트리를 비우기 전까지 복구되지 않는다. 이 때문에 검증 스크립트가 빈 트리에서 시작하도록 고쳤고, 큰 데이터셋을 쓰는 측정에서는 samon_max_entries를 올려야 한다. 오래된 엔트리를 주기적으로 정리하는 aging은 아직 구현하지 않았다.
 
 ## 남은 개발 (제안, 아직 문서로 확정되지 않음)
 
