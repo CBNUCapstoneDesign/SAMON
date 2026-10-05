@@ -29,6 +29,17 @@ fi
 [ "$(cat $KD/0/state)" = on ] && ok "kdamond on" || { bad "kdamond not on"; exit 1; }
 [ -r $DBG/stats ] && ok "stats file present" || { bad "no stats file (old kernel?)"; exit 1; }
 
+# Start from an empty tree and default parameters.  Leftover entries (e.g. from a
+# benchmark run) can fill the tree up to samon_max_entries; new LBAs are then
+# silently dropped (drop_full) and the checks below fail for that reason alone.
+wait_state() { for _ in $(seq 1 50); do [ "$(cat $KD/0/state)" = "$1" ] && return 0; sleep 0.2; done; return 1; }
+PARM0=/sys/module/saddr/parameters
+echo 1 > $PARM0/samon_opt_b; echo 0 > $PARM0/samon_dev_major; echo 0 > $PARM0/samon_dev_minor
+echo off > $KD/0/state; wait_state off || { bad "kdamond did not stop for reset"; exit 1; }
+echo on > $KD/0/state;  wait_state on  || { bad "kdamond did not restart after reset"; exit 1; }
+DF0=$(awk -F= '$1=="drop_full"{print $2+0}' $DBG/stats)
+ok "restarted kdamond: empty tree, default parameters"
+
 # file sector set from filefrag (fs block -> 512B sector, + partition offset)
 file_sectors() {
   filefrag -e "$1" | awk -v bs="$BS" -v st="$START" '
@@ -81,7 +92,6 @@ echo "after window expiry writes=$W for lba=$HSEC"
 
 PARM=/sys/module/saddr/parameters
 BASEDIR=$(dirname "$(readlink -f "$0")")
-wait_state() { for _ in $(seq 1 50); do [ "$(cat $KD/0/state)" = "$1" ] && return 0; sleep 0.2; done; return 1; }
 hot_loop() { for i in $(seq 1 $((THR+5))); do dd if=/dev/zero of="$1" bs=4k count=1 conv=notrunc oflag=sync status=none; done; sync; sleep 0.3; }
 
 # 4. DMA-pinned path: O_DIRECT write whose source is a file-backed mmap page
@@ -160,6 +170,9 @@ NM0=$(st_get nomap_meta); NO0=$(st_get nomap_other); NW0=$(st_get nomap_write); 
 for i in $(seq 1 50); do dd if=/dev/zero of=$DIR/fs$i bs=4k count=1 conv=fsync status=none; done; sync; sleep 0.5
 echo "info: fsync x50 -> seg_buffered +$(( $(st_get seg_buffered) - SB0 )) (journal/data writes seen as buffered), nomap_meta +$(( $(st_get nomap_meta) - NM0 )), nomap_other +$(( $(st_get nomap_other) - NO0 )), nomap_write +$(( $(st_get nomap_write) - NW0 ))"
 echo "info: nomap breakdown: slab=$(st_get nomap_slab) flagged=$(st_get nomap_flagged) meta=$(st_get nomap_meta) other=$(st_get nomap_other) write=$(st_get nomap_write) (of $(st_get skip_nomap))"
+
+DFD=$(( $(st_get drop_full) - DF0 ))
+[ "$DFD" -eq 0 ] && ok "tree never saturated during the run (drop_full +0)" || bad "tree saturated: drop_full +$DFD, earlier results may be invalid"
 
 echo "stats:"; cat $DBG/stats
 echo "PASS=$PASS FAIL=$FAIL"

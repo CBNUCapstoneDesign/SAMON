@@ -11,15 +11,15 @@
 #
 # usage: sudo bash samon_bench.sh [-d DIR] [-s hot_size] [-S scan_size]
 #                                 [-m mem_max] [-t secs] [-n reps] [-w mixed|zipf]
-#                                 [-o outdir] [-r ramp_secs] [-D]
+#                                 [-o outdir] [-r ramp_secs] [-E max_entries] [-D]
 #   -D  dry run: no root needed, no cgroup/kdamond/params, only fio + CSV
 #       pipeline (for testing the harness itself; the numbers mean nothing)
 set -u
 DIR=/var/tmp/samon_bench; HOT=1G; SCAN=2G; MEM=768M; SECS=60; REPS=5; WL=mixed
-OUT=""; DRY=0; RAMP=10
-while getopts "d:s:S:m:t:n:w:o:r:D" o; do case $o in
+OUT=""; DRY=0; RAMP=10; MAXENT=2097152
+while getopts "d:s:S:m:t:n:w:o:r:E:D" o; do case $o in
   d) DIR=$OPTARG;; s) HOT=$OPTARG;; S) SCAN=$OPTARG;; m) MEM=$OPTARG;;
-  t) SECS=$OPTARG;; n) REPS=$OPTARG;; w) WL=$OPTARG;; o) OUT=$OPTARG;; r) RAMP=$OPTARG;; D) DRY=1;;
+  t) SECS=$OPTARG;; n) REPS=$OPTARG;; w) WL=$OPTARG;; o) OUT=$OPTARG;; r) RAMP=$OPTARG;; E) MAXENT=$OPTARG;; D) DRY=1;;
   *) exit 2;; esac; done
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -53,14 +53,17 @@ set_mode() {
       # writing "off" to an already stopped kdamond fails with EPERM; only stop if running
       [ "$(cat $KD/0/state)" = off ] || { echo off > $KD/0/state; wait_state off || { echo "kdamond stop failed"; exit 1; }; } ;;
     on_noB|on_B)
-      [ "$(cat $KD/0/state)" = on ] || { echo on > $KD/0/state; wait_state on || { echo "kdamond start failed"; exit 1; }; }
+      # restart every run so each starts with an empty LBA tree; leftovers from the
+      # previous run would otherwise saturate samon_max_entries (drop_full) and bias results
+      [ "$(cat $KD/0/state)" = off ] || { echo off > $KD/0/state; wait_state off || { echo "kdamond stop failed"; exit 1; }; }
+      echo on > $KD/0/state; wait_state on || { echo "kdamond start failed"; exit 1; }
       [ $1 = on_B ] && echo 1 > $PARM/samon_opt_b || echo 0 > $PARM/samon_opt_b
       echo $DMAJ > $PARM/samon_dev_major; echo $DMIN > $PARM/samon_dev_minor ;;
   esac
 }
 restore() {
   [ $DRY = 1 ] && return
-  echo 1 > $PARM/samon_opt_b 2>/dev/null; echo 0 > $PARM/samon_dev_major 2>/dev/null; echo 0 > $PARM/samon_dev_minor 2>/dev/null
+  echo 65536 > $PARM/samon_max_entries 2>/dev/null; echo 1 > $PARM/samon_opt_b 2>/dev/null; echo 0 > $PARM/samon_dev_major 2>/dev/null; echo 0 > $PARM/samon_dev_minor 2>/dev/null
   rmdir $CG 2>/dev/null
 }
 trap restore EXIT
@@ -112,6 +115,7 @@ JOB
   fi
 }
 
+[ $DRY = 0 ] && echo $MAXENT > $PARM/samon_max_entries   # data set (hot+scan) has far more 4KB LBAs than the default cap
 echo "run,mode,rep,hot_r_iops,hot_w_iops,hot_r_p99_us,hot_w_p99_us,scan_bw_kib,$(echo $VMKEYS | tr ' ' ','),$(echo $STKEYS | tr ' ' ','),$(for k in $CGKEYS; do printf 'cg_%s,' $k; done | sed 's/,$//')" > $CSV
 RUN=0
 for rep in $(seq 1 $REPS); do
@@ -152,6 +156,10 @@ PY
     SD=""; for k in $STKEYS; do
       if [ $DRY = 0 ] && [ "${mode#on}" != "$mode" ]; then SD="$SD,$(( $(st_get $k) - ${S0[$k]} ))"; else SD="$SD,0"; fi; done
     [ $DRY = 1 ] && CGD=",0,0,0,0,0,0"
+    if [ $DRY = 0 ] && [ "${mode#on}" != "$mode" ]; then
+      DFD=$(( $(st_get drop_full) - ${S0[drop_full]} ))
+      [ "$DFD" -gt 0 ] && echo "  WARNING: LBA tree saturated in this run (drop_full +$DFD); raise -E, results are biased"
+    fi
     echo "$RUN,$mode,$rep,$ROW$VD$SD$CGD" >> $CSV
   done
 done
