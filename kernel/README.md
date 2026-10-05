@@ -79,7 +79,7 @@ address_space가 없는 segment(skip_nomap)는 원인별로 다시 분류해서 
 | nomap_meta | mapping이 NULL이고 REQ_META가 설정됨 (ext4 저널 등 메타데이터 I/O로 추정) |
 | nomap_other | mapping이 NULL이고 REQ_META도 없음. 설명되지 않는 부류이며 samon_dbg_nomap으로 dmesg에 출력해 확인할 수 있다 |
 
-저널(jbd2)이 nomap_meta의 대부분일 것이라는 것은 아직 확인되지 않은 가설이다 (커널 빌드 #10에 반영, verify_samon.sh 섹션 8로 검증 예정).
+"nomap은 ext4 저널(jbd2) I/O일 것"이라는 가설은 측정으로 기각되었다 (커널 #10, fsync 50회 후 nomap_meta +0, nomap_write +0). 저널 블록은 블록 디바이스 page cache에 mapping이 있어 일반 관측 대상으로 기록되는 것으로 보이나, 이를 직접 확인하지는 않았다. 해당 부팅에서 skip_nomap 총합은 18건이었고 전부 nomap_other(read 방향)였으며, 정체는 확인되지 않았다. 이전 실행에서 보였던 수만 건의 nomap은 이 실행에서 재현되지 않았고 원인을 알지 못한다.
 
 ### 4. LBA→page 연동 자료구조
 - LBA를 키로 하는 rbtree. 엔트리는 lba, pfn, read_count, write_count, last_jiffies를 가진다.
