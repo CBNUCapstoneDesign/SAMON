@@ -150,6 +150,16 @@ echo "cycle test: max writes per file LBA over 10 off/on cycles = $MAXW"
 NEWWARN=$(dmesg | tail -n +$((DM0+1)) | grep -ciE 'BUG:|WARNING:|Oops|KASAN|lockdep|RCU stall|soft lockup')
 [ "$NEWWARN" -eq 0 ] && ok "no kernel warnings during tests" || bad "kernel warnings in dmesg ($NEWWARN)"
 
+# 8. skip_nomap breakdown: the four classes must add up to skip_nomap, and
+#    journal (fsync) I/O must show up as REQ_META with no mapping.
+NM_SUM() { echo $(( $(st_get nomap_slab) + $(st_get nomap_flagged) + $(st_get nomap_meta) + $(st_get nomap_other) )); }
+[ "$(NM_SUM)" -eq "$(st_get skip_nomap)" ] && ok "nomap classes sum to skip_nomap ($(st_get skip_nomap))" || bad "nomap classes ($(NM_SUM)) != skip_nomap ($(st_get skip_nomap))"
+NM0=$(st_get nomap_meta); NO0=$(st_get nomap_other); NW0=$(st_get nomap_write)
+for i in $(seq 1 50); do dd if=/dev/zero of=$DIR/fs$i bs=4k count=1 conv=fsync status=none; done; sync; sleep 0.5
+echo "fsync x50: nomap_meta +$(( $(st_get nomap_meta) - NM0 )), nomap_other +$(( $(st_get nomap_other) - NO0 )), nomap_write +$(( $(st_get nomap_write) - NW0 ))"
+[ $(( $(st_get nomap_meta) - NM0 )) -gt 0 ] && ok "fsync journal I/O classified as nomap_meta" || bad "no nomap_meta growth on fsync workload"
+echo "nomap breakdown: slab=$(st_get nomap_slab) flagged=$(st_get nomap_flagged) meta=$(st_get nomap_meta) other=$(st_get nomap_other) (of $(st_get skip_nomap))"
+
 echo "stats:"; cat $DBG/stats
 echo "PASS=$PASS FAIL=$FAIL"
 [ $FAIL -eq 0 ]

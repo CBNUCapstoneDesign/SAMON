@@ -65,6 +65,11 @@ module_param(samon_dev_minor, uint, 0644);
 MODULE_PARM_DESC(samon_dev_minor,
 	"Observe only this whole disk (first_minor), used with samon_dev_major");
 
+static unsigned int samon_dbg_nomap;
+module_param(samon_dbg_nomap, uint, 0644);
+MODULE_PARM_DESC(samon_dbg_nomap,
+	"Log no-mapping segments of the unexplained class (nomap_other) to dmesg while the cumulative nomap_other count is <= this value (0 = off)");
+
 static unsigned int samon_max_entries = 65536;
 module_param(samon_max_entries, uint, 0644);
 MODULE_PARM_DESC(samon_max_entries,
@@ -116,6 +121,12 @@ static atomic64_t samon_st_skip_nomap;	/* no address_space                */
 static atomic64_t samon_st_skip_pinned;	/* DMA-pinned (direct I/O)         */
 static atomic64_t samon_st_drop_full;	/* tree at samon_max_entries       */
 static atomic64_t samon_st_drop_nomem;	/* GFP_ATOMIC failure              */
+/* breakdown of skip_nomap (the four below always sum to skip_nomap) */
+static atomic64_t samon_st_nomap_slab;	/* slab-backed buffer              */
+static atomic64_t samon_st_nomap_flagged;/* mapping has movable/ksm flags   */
+static atomic64_t samon_st_nomap_meta;	/* mapping==NULL, REQ_META set     */
+static atomic64_t samon_st_nomap_other;	/* mapping==NULL, REQ_META clear   */
+static atomic64_t samon_st_nomap_write;	/* nomap segments of WRITE (all)   */
 static atomic64_t samon_st_skip_dev;	/* request on a non-target disk    */
 static atomic64_t samon_st_budget_cut;	/* partial completion (< rq bytes) */
 static atomic64_t samon_st_mark_accessed;/* folio_mark_accessed() calls    */
@@ -208,7 +219,35 @@ static void samon_lba_tree_free(void)
  * Returns the folio on success, NULL when the segment must be skipped.
  * Every skip reason is counted so the filter can be verified from userspace.
  */
-static struct folio *samon_segment_folio(struct bio_vec *bv)
+static void samon_classify_nomap(struct bio *bio, struct folio *folio, int dir)
+{
+	unsigned long raw = (unsigned long)READ_ONCE(folio->mapping);
+
+	atomic64_inc(&samon_st_skip_nomap);
+	if (dir == WRITE)
+		atomic64_inc(&samon_st_nomap_write);
+
+	if (folio_test_slab(folio)) {
+		atomic64_inc(&samon_st_nomap_slab);
+	} else if (raw & PAGE_MAPPING_FLAGS) {
+		atomic64_inc(&samon_st_nomap_flagged);
+	} else if (bio->bi_opf & REQ_META) {
+		atomic64_inc(&samon_st_nomap_meta);
+	} else {
+		atomic64_inc(&samon_st_nomap_other);
+		/* the unexplained class: log a few for inspection */
+		if (READ_ONCE(samon_dbg_nomap) &&
+		    atomic64_read(&samon_st_nomap_other) <= READ_ONCE(samon_dbg_nomap))
+			pr_info("nomap: dir=%s opf=0x%x sector=%llu folio_flags=%pGp refcount=%d\n",
+				dir == WRITE ? "W" : "R",
+				(unsigned int)bio->bi_opf,
+				(unsigned long long)bio->bi_iter.bi_sector,
+				&folio->flags, folio_ref_count(folio));
+	}
+}
+
+static struct folio *samon_segment_folio(struct bio *bio, struct bio_vec *bv,
+					 int dir)
 {
 	struct folio *folio;
 
@@ -224,7 +263,7 @@ static struct folio *samon_segment_folio(struct bio_vec *bv)
 		return NULL;
 	}
 	if (!folio_mapping(folio)) {
-		atomic64_inc(&samon_st_skip_nomap);
+		samon_classify_nomap(bio, folio, dir);
 		return NULL;
 	}
 	if (folio_maybe_dma_pinned(folio)) {
@@ -263,7 +302,7 @@ static bool samon_handle_bio(struct bio *bio, int dir, unsigned int *budget)
 			return true;
 		*budget -= min(*budget, bv.bv_len);
 
-		folio = samon_segment_folio(&bv);
+		folio = samon_segment_folio(bio, &bv, dir);
 		if (!folio)
 			goto next_seg;
 
@@ -555,6 +594,16 @@ static int samon_stats_show(struct seq_file *m, void *v)
 		   (long long)atomic64_read(&samon_st_drop_full));
 	seq_printf(m, "drop_nomem=%lld\n",
 		   (long long)atomic64_read(&samon_st_drop_nomem));
+	seq_printf(m, "nomap_slab=%lld\n",
+		   (long long)atomic64_read(&samon_st_nomap_slab));
+	seq_printf(m, "nomap_flagged=%lld\n",
+		   (long long)atomic64_read(&samon_st_nomap_flagged));
+	seq_printf(m, "nomap_meta=%lld\n",
+		   (long long)atomic64_read(&samon_st_nomap_meta));
+	seq_printf(m, "nomap_other=%lld\n",
+		   (long long)atomic64_read(&samon_st_nomap_other));
+	seq_printf(m, "nomap_write=%lld\n",
+		   (long long)atomic64_read(&samon_st_nomap_write));
 	seq_printf(m, "skip_dev=%lld\n",
 		   (long long)atomic64_read(&samon_st_skip_dev));
 	seq_printf(m, "budget_cut=%lld\n",

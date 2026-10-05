@@ -42,6 +42,7 @@ cat /sys/kernel/debug/samon/stats
 |---|---|---|
 | samon_hot_threshold | 10 | 윈도우 안에서 이 횟수 이상 발생하면 hot으로 판정 |
 | samon_window_ms | 1000 | 빈도수를 세는 관측 윈도우(ms) |
+| samon_dbg_nomap | 0 | nomap_other 부류의 segment를 이 개수까지 dmesg에 기록(누적 기준), 0이면 끔 |
 | samon_max_entries | 65536 | LBA 트리에 보관하는 엔트리 상한 (메모리 상한) |
 | samon_opt_b | 1 | 옵션 B 토글. 0이면 hot write에서도 folio_mark_accessed()를 호출하지 않는다 (효과 비교용) |
 | samon_dev_major, samon_dev_minor | 0, 0 | 관측 대상 디스크(whole disk의 major, first_minor). major가 0이면 모든 디바이스를 관측한다 |
@@ -69,6 +70,17 @@ cat /sys/kernel/debug/samon/stats
 | address_space가 없음 | page cache와 무관 | skip_nomap |
 | folio_maybe_dma_pinned() | direct I/O는 사용자 버퍼를 pin하므로, mmap된 파일 버퍼를 쓰는 direct I/O도 걸러진다 | skip_pinned |
 
+address_space가 없는 segment(skip_nomap)는 원인별로 다시 분류해서 센다. 네 부류의 합은 항상 skip_nomap과 같다.
+
+| 카운터 | 의미 |
+|---|---|
+| nomap_slab | slab에서 할당된 버퍼 |
+| nomap_flagged | mapping에 movable/KSM 플래그가 있음 |
+| nomap_meta | mapping이 NULL이고 REQ_META가 설정됨 (ext4 저널 등 메타데이터 I/O로 추정) |
+| nomap_other | mapping이 NULL이고 REQ_META도 없음. 설명되지 않는 부류이며 samon_dbg_nomap으로 dmesg에 출력해 확인할 수 있다 |
+
+저널(jbd2)이 nomap_meta의 대부분일 것이라는 것은 아직 확인되지 않은 가설이다 (커널 빌드 #10에 반영, verify_samon.sh 섹션 8로 검증 예정).
+
 ### 4. LBA→page 연동 자료구조
 - LBA를 키로 하는 rbtree. 엔트리는 lba, pfn, read_count, write_count, last_jiffies를 가진다.
 - struct page 포인터는 저장하지 않고 PFN만 저장한다.
@@ -92,7 +104,7 @@ cat /sys/kernel/debug/samon/stats
 
 ### 8. 관측용 debugfs
 - /sys/kernel/debug/samon/lba_page_map: 엔트리별 lba, pfn, reads, writes, hot_r, hot_w
-- /sys/kernel/debug/samon/stats: rq_seen, seg_buffered, skip_null, skip_anon, skip_nomap, skip_pinned, skip_dev, budget_cut, mark_accessed, drop_full, drop_nomem, entries
+- /sys/kernel/debug/samon/stats: rq_seen, seg_buffered, skip_null, skip_anon, skip_nomap(nomap_slab, nomap_flagged, nomap_meta, nomap_other, nomap_write), skip_pinned, skip_dev, budget_cut, mark_accessed, drop_full, drop_nomem, entries
 
 ## 검증 상태
 
@@ -166,6 +178,15 @@ tmpfs가 아닌 실제 디스크 위의 디렉터리를 지정해야 한다. 결
 - 이 때문에 .config에 CONFIG_MODULE_ALLOW_BTF_MISMATCH=y를 설정했다. 부팅 로그에 BTF mismatch 경고가 한 번 출력되는 것은 정상이다.
 - vmlinux 링크 단계의 BTF 생성(pahole)은 약 4.7GB 메모리를 쓴다. 메모리 4GB VM에서는 OOM으로 빌드가 실패하거나 VM이 멈췄다. 8GB에서는 성공했고 빌드 중 전체 사용량 최대는 약 7GB였다. 병렬 옵션(-j)을 빼려면 make에 PAHOLE_FLAGS를 지정한다.
 - modules_install은 INSTALL_MOD_STRIP=1로 하면 모듈과 initrd 크기가 줄어든다.
+
+## 측정 하네스 (bench/, 준비됨, 아직 커널에서 실행하지 않음)
+
+옵션 B 효과와 오버헤드를 같은 도구로 비교한다. samon_bench.sh는 구성 4개를 반복 실행한다: off(kdamond 정지, probe 없음), off2(두 번째 기준선, 실행 간 잡음 추정용), on_noB(samon_opt_b=0), on_B(samon_opt_b=1). 구성은 매 반복마다 섞어서 실행하고, 매번 cgroup v2 memory.max(기본 768M)와 drop_caches로 시작한다. 워크로드는 zipf 랜덤 read/write(hot, 2잡, fdatasync 32회마다)와 큰 파일 순차 read(scan)를 동시에 돌리며 hot 잡의 IOPS와 p99 지연을 보고한다. 실행 전후로 /proc/vmstat(refault, activate, steal, scan 등)와 saddr stats의 차분을 CSV에 기록하고, summarize.py가 구성별 평균과 표준편차, off 대비 차이, off 대 off2 차이(잡음)를 표로 만든다.
+
+- 실행: sudo bash bench/samon_bench.sh -d /var/tmp/samon_bench -n 5
+- 검증된 것: 스크립트 문법, fio 잡 정의에서 hot과 scan이 별도로 보고되는 것(드라이런), summarize.py의 계산(합성 데이터). 드라이런(-D)은 cgroup, kdamond, 모듈 파라미터를 건드리지 않으며 수치는 의미가 없다.
+- 검증되지 않은 것: 실제 SAMON 커널에서의 실행, 메모리 압박 설정의 적절성(워킹셋 대비 한도), 반복 횟수 5의 충분성. summarize.py의 판정 규칙은 대략적 선별 기준이며 유의성 검정이 아니다.
+- pgbench는 이 VM에 설치되어 있지 않아 첫 하네스는 fio 기반이다.
 
 ## 알려진 한계
 
