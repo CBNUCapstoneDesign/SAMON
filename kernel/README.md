@@ -79,7 +79,11 @@ address_space가 없는 segment(skip_nomap)는 원인별로 다시 분류해서 
 | nomap_meta | mapping이 NULL이고 REQ_META가 설정됨 (ext4 저널 등 메타데이터 I/O로 추정) |
 | nomap_other | mapping이 NULL이고 REQ_META도 없음. 설명되지 않는 부류이며 samon_dbg_nomap으로 dmesg에 출력해 확인할 수 있다 |
 
-"nomap은 ext4 저널(jbd2) I/O일 것"이라는 가설은 측정으로 기각되었다 (커널 #10, fsync 50회 후 nomap_meta +0, nomap_write +0). 저널 블록은 블록 디바이스 page cache에 mapping이 있어 일반 관측 대상으로 기록되는 것으로 보이나, 이를 직접 확인하지는 않았다. 해당 부팅에서 skip_nomap 총합은 18건이었고 전부 nomap_other(read 방향)였으며, 정체는 확인되지 않았다. 이전 실행에서 보였던 수만 건의 nomap은 이 실행에서 재현되지 않았고 원인을 알지 못한다.
+"nomap은 ext4 저널(jbd2) I/O일 것"이라는 가설은 측정으로 기각되었다 (커널 #10, fsync 50회 후 nomap_meta +0, nomap_write +0). 저널 블록은 블록 디바이스 page cache에 mapping이 있어 일반 관측 대상으로 기록되는 것으로 보이나, 이를 직접 확인하지는 않았다.
+
+nomap_other의 정체 (samon_dbg_nomap 로그로 확인): 기록된 segment는 모두 dir=R, opf=0x22, sector=0, 데이터 page가 아닌 커널 내부 버퍼(refcount=1)였다. opf 하위 8비트 0x22(34)는 REQ_OP_DRV_IN이며, drivers/scsi/sr.c(CD-ROM 드라이버)가 이 op로 명령을 보낸다. 발생 주기는 약 2.05초마다 2건이었고, 이 VM에는 이벤트(media_change) 폴링 대상 CD-ROM(sr0, sr1)이 2개 있다. 따라서 CD-ROM 미디어 변경 감지 폴링으로 판단한다. 한계: 로그에 디바이스 이름이 없어 두 CD-ROM에서 나온다는 것을 직접 확인한 것은 아니고 정황(op 코드, 호출 위치, 주기와 개수)의 일치에 근거한다. 이 부류는 page cache I/O가 아니므로 관측 대상에서 제외되는 것이 맞다. 다음 재빌드에서 passthrough request(blk_rq_is_passthrough)를 별도 카운터 skip_passthru로 분리할 예정이며, 반영 전까지 이 항목은 nomap_other에 섞여 집계된다.
+
+이전 실행에서 보였던 수만 건의 nomap은 이 폴링만으로 설명되지 않는다(1초에 약 1건 수준). 그 값이 어디서 나왔는지는 확인하지 못했다.
 
 ### 4. LBA→page 연동 자료구조
 - LBA를 키로 하는 rbtree. 엔트리는 lba, pfn, read_count, write_count, last_jiffies를 가진다.
