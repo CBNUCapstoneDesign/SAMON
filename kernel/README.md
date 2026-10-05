@@ -1,8 +1,21 @@
 # SAMON 커널 operations set (saddr)
 
-Linux 커널 6.8의 DAMON operations set으로 구현한 스토리지(블록 디바이스) 주소 공간 모니터링 코드이다. block layer에서 완료된 I/O를 LBA 단위로 관측하고, read/write 빈도수로 자주 발생하는 I/O를 판정하며, 해당 LBA를 실제 page(PFN)와 정방향으로 연결한다.
+Linux 커널 6.8의 DAMON operations set으로 구현한 스토리지(블록 디바이스) 주소 공간 관측 코드이다. block layer에서 완료된 I/O를 LBA 단위로 관측하고, read/write 빈도수로 자주 발생하는 I/O를 판정하며, 해당 LBA를 실제 page(PFN)와 정방향으로 연결한다. 현재 page에 대한 조작은 hot write에 `folio_mark_accessed()`를 호출하는 힌트 한 가지뿐이며 그 효과는 측정하지 않았다.
 
 eBPF 기반 유저스페이스 스크립트(samon_probe.py, samon_monitor.py 등)는 이 구현의 기반이 아니다. 이 디렉터리의 코드는 모두 커널 내부(mm/damon/saddr.c)에서 동작한다.
+
+## 현재 구현 범위 한눈에 보기
+
+| 구분 | 상태 |
+|---|---|
+| 관측 (block_rq_complete, buffered I/O 한정, 디스크 필터) | 구현, 검증됨 |
+| LBA to page 정방향 연동 (4KB 단위 rbtree, PFN 기록) | 구현, 검증됨 |
+| 빈도 판정 (read/write 분리 카운터, 시간 창, 단일 임계값) | 구현, 검증됨 |
+| page 조작 (hot write에 folio_mark_accessed 1회) | 구현, 토글 동작은 검증됨, **효과와 호출 컨텍스트 안전성은 미검증** |
+| 영역(region) 단위 집계, 패턴 분류 | 미구현 |
+| 정책 판단(promote/유지/demote 결정), read 쪽 조작, demote | 미구현 |
+| 점수 체계, DAMOS 연동 | 미구현 (범위 밖) |
+| 효과 측정 | 하네스 스크립트만 있고 실행하지 않음 |
 
 ## 파일
 
@@ -13,6 +26,7 @@ eBPF 기반 유저스페이스 스크립트(samon_probe.py, samon_monitor.py 등
 | damon_Kconfig | mm/damon/Kconfig 대체본 (CONFIG_DAMON_SADDR 추가) |
 | verify_samon.sh | 기능 검증 스크립트 (root 권한, 재부팅 후 실행) |
 | test_pinned.c | verify_samon.sh가 컴파일해서 쓰는 테스트. mmap한 파일 페이지를 소스로 하는 O_DIRECT write |
+| ../bench/samon_bench.sh, ../bench/summarize.py | 측정 하네스 (아래 참조) |
 
 ## 적용 방법
 
@@ -20,8 +34,8 @@ eBPF 기반 유저스페이스 스크립트(samon_probe.py, samon_monitor.py 등
 2. mm/damon/Makefile을 damon_Makefile로, mm/damon/Kconfig를 damon_Kconfig로 교체한다.
 3. include/linux/damon.h의 enum damon_ops_id에 DAMON_OPS_SADDR을 추가한다 (NR_DAMON_OPS 앞).
 4. mm/damon/sysfs.c의 damon_sysfs_ops_strs[]에 "saddr"를 추가한다.
-5. .config에 CONFIG_DAMON_SADDR=y를 설정하고 커널을 빌드, 설치, 재부팅한다.
-6. 재부팅할 때마다 kdamond를 saddr operations로 설정하고 켠다 (아래 사용법 참조). tracepoint는 kdamond가 시작될 때 등록된다.
+5. .config에 CONFIG_DAMON_SADDR=y를 설정하고 커널을 빌드, 설치, 재부팅한다. 빌드 시 주의사항은 아래 "빌드 시 주의"를 따른다.
+6. 재부팅할 때마다 kdamond를 saddr operations로 설정하고 켠다 (아래 사용법 참조). tracepoint는 kdamond가 시작될 때 등록되므로 부팅만으로는 관측이 시작되지 않는다.
 
 ## 사용법
 
@@ -36,32 +50,33 @@ cat /sys/kernel/debug/samon/lba_page_map
 cat /sys/kernel/debug/samon/stats
 ```
 
-모듈 파라미터 (빌트인이므로 /sys/module/saddr/parameters/ 에서 런타임 변경 가능):
+모듈 파라미터 (빌트인이므로 /sys/module/saddr/parameters/ 에서 런타임 변경 가능, 재부팅하면 기본값으로 돌아간다):
 
 | 파라미터 | 기본값 | 의미 |
 |---|---|---|
 | samon_hot_threshold | 10 | 윈도우 안에서 이 횟수 이상 발생하면 hot으로 판정 |
 | samon_window_ms | 1000 | 빈도수를 세는 관측 윈도우(ms) |
-| samon_dbg_nomap | 0 | nomap_other 부류의 segment를 이 개수까지 dmesg에 기록(누적 기준), 0이면 끔 |
-| samon_max_entries | 65536 | LBA 트리에 보관하는 엔트리 상한 (메모리 상한) |
 | samon_opt_b | 1 | 옵션 B 토글. 0이면 hot write에서도 folio_mark_accessed()를 호출하지 않는다 (효과 비교용) |
 | samon_dev_major, samon_dev_minor | 0, 0 | 관측 대상 디스크(whole disk의 major, first_minor). major가 0이면 모든 디바이스를 관측한다 |
+| samon_max_entries | 65536 | LBA 트리에 보관하는 엔트리 상한 (메모리 상한) |
+| samon_dbg_nomap | 0 | nomap_other 부류의 segment를 누적 개수가 이 값 이하인 동안 dmesg에 기록, 0이면 끔 |
 
-## 구현된 기능
+## 구현 내용
 
 ### 1. 관측 훅지점
-- block_rq_complete tracepoint를 register_trace_block_rq_complete()로 구독한다.
+- block_rq_complete tracepoint에 register_trace_block_rq_complete()로 콜백을 등록한다.
 - 완료 에러(error != 0)인 request는 관측에서 제외한다.
 - rq_data_dir()로 READ/WRITE를 구분한다.
 - 부분 완료 처리: 이 tracepoint는 blk_update_request() 맨 앞에서 bio_advance()/bio_endio() 이전에 발화하며, request가 여러 번에 나뉘어 완료되면 그때마다 발화한다. 콜백은 nr_bytes만큼의 segment만 순회해서 같은 segment를 중복 집계하지 않는다. nr_bytes가 request 전체보다 작았던 횟수는 stats의 budget_cut에 기록한다.
 - 대상 디스크 필터(samon_dev_major/minor)에 맞지 않는 request는 skip_dev로 세고 건너뛴다.
+- 이 훅은 block 완료 경로(softirq 또는 인터럽트 컨텍스트일 수 있음)에서 실행된다.
 
 ### 2. bio에서 page 추출
 - request에 연결된 bio를 __rq_for_each_bio()로 순회하고, bio_for_each_segment()로 bi_io_vec의 각 segment에 접근한다.
 - LBA는 bio->bi_iter.bi_sector(512바이트 섹터)에서 시작해 segment마다 bv_len >> SECTOR_SHIFT 만큼 누적한다.
 
-### 3. buffered I/O 한정 필터 (이번에 재작성)
-이전 구현은 bio의 첫 segment만 page_mapping()으로 확인했다. 이는 direct I/O 여부가 아니라 page cache 여부만 보는 방식이어서 segment마다 다른 경우를 놓칠 수 있었다. 현재는 segment마다 다음을 검사하고, 하나라도 해당하면 건너뛴다.
+### 3. buffered I/O 한정 필터 (segment 단위)
+segment마다 다음을 검사하고, 하나라도 해당하면 건너뛰며 사유별로 센다.
 
 | 검사 | 건너뛰는 이유 | 통계 항목 |
 |---|---|---|
@@ -70,118 +85,97 @@ cat /sys/kernel/debug/samon/stats
 | address_space가 없음 | page cache와 무관 | skip_nomap |
 | folio_maybe_dma_pinned() | direct I/O는 사용자 버퍼를 pin하므로, mmap된 파일 버퍼를 쓰는 direct I/O도 걸러진다 | skip_pinned |
 
-address_space가 없는 segment(skip_nomap)는 원인별로 다시 분류해서 센다. 네 부류의 합은 항상 skip_nomap과 같다.
+skip_nomap은 원인별로 다시 분류해서 센다. 네 부류(nomap_slab, nomap_flagged, nomap_meta, nomap_other)의 합은 항상 skip_nomap과 같고, nomap_write는 이 중 WRITE 방향의 개수이다.
 
 | 카운터 | 의미 |
 |---|---|
 | nomap_slab | slab에서 할당된 버퍼 |
 | nomap_flagged | mapping에 movable/KSM 플래그가 있음 |
-| nomap_meta | mapping이 NULL이고 REQ_META가 설정됨 (ext4 저널 등 메타데이터 I/O로 추정) |
-| nomap_other | mapping이 NULL이고 REQ_META도 없음. 설명되지 않는 부류이며 samon_dbg_nomap으로 dmesg에 출력해 확인할 수 있다 |
+| nomap_meta | mapping이 NULL이고 REQ_META가 설정됨 |
+| nomap_other | mapping이 NULL이고 REQ_META도 없음 |
 
-"nomap은 ext4 저널(jbd2) I/O일 것"이라는 가설은 측정으로 기각되었다 (커널 #10, fsync 50회 후 nomap_meta +0, nomap_write +0). 저널 블록은 블록 디바이스 page cache에 mapping이 있어 일반 관측 대상으로 기록되는 것으로 보이나, 이를 직접 확인하지는 않았다.
+nomap의 정체에 대한 확인 결과:
 
-nomap_other의 정체 (samon_dbg_nomap 로그로 확인): 기록된 segment는 모두 dir=R, opf=0x22, sector=0, 데이터 page가 아닌 커널 내부 버퍼(refcount=1)였다. opf 하위 8비트 0x22(34)는 REQ_OP_DRV_IN이며, drivers/scsi/sr.c(CD-ROM 드라이버)가 이 op로 명령을 보낸다. 발생 주기는 약 2.05초마다 2건이었고, 이 VM에는 이벤트(media_change) 폴링 대상 CD-ROM(sr0, sr1)이 2개 있다. 따라서 CD-ROM 미디어 변경 감지 폴링으로 판단한다. 한계: 로그에 디바이스 이름이 없어 두 CD-ROM에서 나온다는 것을 직접 확인한 것은 아니고 정황(op 코드, 호출 위치, 주기와 개수)의 일치에 근거한다. 이 부류는 page cache I/O가 아니므로 관측 대상에서 제외되는 것이 맞다. 다음 재빌드에서 passthrough request(blk_rq_is_passthrough)를 별도 카운터 skip_passthru로 분리할 예정이며, 반영 전까지 이 항목은 nomap_other에 섞여 집계된다.
+- "nomap은 ext4 저널(jbd2) I/O일 것"이라는 가설은 측정으로 기각되었다 (커널 #10, fsync 50회 후 nomap_meta +0, nomap_write +0). 저널 블록은 블록 디바이스 page cache에 mapping이 있어 일반 관측 대상으로 기록되는 것으로 보이나, 이를 직접 확인하지는 않았다.
+- nomap_other는 samon_dbg_nomap 로그로 확인했다. 기록된 segment는 모두 dir=R, opf=0x22, sector=0, 데이터 page가 아닌 커널 내부 버퍼(refcount=1)였다. opf 하위 8비트 0x22(34)는 REQ_OP_DRV_IN이며 drivers/scsi/sr.c(CD-ROM 드라이버)가 이 op로 명령을 보낸다. 발생 주기는 약 2.05초마다 2건이었고, 이 VM에는 media_change 폴링 대상 CD-ROM(sr0, sr1)이 2개 있다. 따라서 CD-ROM 미디어 변경 감지 폴링으로 판단한다.
+- 한계: 로그에 디바이스 이름이 없어 두 CD-ROM에서 나온다는 것을 직접 확인한 것은 아니고 정황(op 코드, 호출 위치, 주기와 개수)의 일치에 근거한다. 이 부류는 page cache I/O가 아니므로 관측 대상에서 제외되는 것이 맞다.
+- 필터(samon_dev_major=8)를 켠 뒤 nomap_other가 +8 늘어난 것을 한때 sda에서도 nomap이 나오는 증거로 해석했으나, 폴링 주기(약 1건/초)와 필터를 켜기까지의 시간으로 설명되므로 그 해석은 철회했다.
+- 이전 실행에서 보였던 수만 건의 nomap은 이 폴링만으로 설명되지 않는다(1초에 약 1건 수준). 그 값이 어디서 나왔는지는 확인하지 못했다.
+- 예정: passthrough request(blk_rq_is_passthrough)를 별도 카운터 skip_passthru로 분리한다. 반영 전까지는 nomap_other에 섞여 집계된다.
 
-이전 실행에서 보였던 수만 건의 nomap은 이 폴링만으로 설명되지 않는다(1초에 약 1건 수준). 그 값이 어디서 나왔는지는 확인하지 못했다.
-
-### 4. LBA→page 연동 자료구조
-- LBA를 키로 하는 rbtree. 엔트리는 lba, pfn, read_count, write_count, last_jiffies를 가진다.
+### 4. LBA to page 연동 자료구조
+- LBA를 키로 하는 rbtree. 엔트리는 lba, pfn, read_count, write_count, last_jiffies를 가진다. 엔트리는 4KB segment 단위이며 영역(region) 단위 집계는 하지 않는다.
 - struct page 포인터는 저장하지 않고 PFN만 저장한다.
 - spinlock(irqsave)으로 보호한다. 콜백 안에서는 GFP_ATOMIC만 사용한다.
 - 엔트리 수는 samon_max_entries로 제한한다 (초과 시 drop_full 증가).
 
-### 5. 빈도수 기반 패턴 판정
+### 5. 빈도수 기반 판정
 - read/write 카운터를 분리해서 센다.
 - 윈도우(samon_window_ms)가 지나면 카운터를 0으로 리셋한다.
-- 방향별 카운터가 samon_hot_threshold 이상이면 hot으로 판정한다 (이진 판정. 점수 등급 체계는 구현하지 않았다).
+- 방향별 카운터가 samon_hot_threshold 이상이면 hot으로 판정한다 (이진 판정). 순차/랜덤/반복 같은 패턴 분류와 점수 등급 체계는 구현하지 않았다.
 
 ### 6. 옵션 B (미래 접근 예측 반영)
 - hot으로 판정된 write completion에서 folio_mark_accessed()를 호출한다. 기존 커널 API만 사용하며 커널 소스는 수정하지 않는다.
-- read는 이 단계에서 관측만 하며, read 시점 힌트의 효과는 측정으로 판단할 사안으로 남겨 둔다. 이전 버전의 "read는 커널이 이미 accessed 처리를 한다"는 주석은 근거가 부족하여 제거했다. read 완료 시점의 page는 LRU에 올라가 있지만 사용자 접근 전이다.
+- read는 관측만 한다. read 시점 힌트의 효과는 측정으로 판단할 사안으로 남겨 둔다. read 완료 시점의 page는 LRU에 올라가 있지만 사용자 접근 전이다.
 - samon_opt_b 파라미터로 호출을 끌 수 있어, 켠 경우와 끈 경우를 같은 워크로드로 비교할 수 있다. 호출 횟수는 stats의 mark_accessed에 기록한다.
+- 호출 컨텍스트 안전성 (미검증): folio_mark_accessed()는 내부에서 folio_activate()를 호출하고, 이 함수는 mm/swap.c에서 local_lock(&cpu_fbatches.lock)(인터럽트를 막지 않는 형태)을 쓴다. 이 훅은 softirq/인터럽트 컨텍스트에서 실행될 수 있으므로, 프로세스가 같은 per-CPU 배치를 갱신하는 도중에 끼어들면 배치가 손상될 가능성이 있다. 지금까지 경고나 이상은 관찰되지 않았지만 lockdep 등 엄격한 검사 빌드로 확인한 적이 없어, 안전하다고 확인된 것이 아니다. 해결 방향은 콜백에서는 기록만 하고 조작은 프로세스 컨텍스트로 지연 실행하는 것이다.
 
-### 7. 안정성 보강 (이번에 추가)
+### 7. 안정성 처리
 - kdamond를 재시작해도 tracepoint가 중복 등록되지 않도록 등록 상태 플래그를 둔다.
 - cleanup은 unregister 후 tracepoint_synchronize_unregister()를 호출한 뒤 트리를 해제한다.
 - 기존 region 카운터 경로의 nr_regions는 READ_ONCE/WRITE_ONCE로 읽고 쓰며, 읽을 때 배열 크기로 clamp하여 동시 갱신 중에도 범위 밖 접근이 생기지 않게 한다.
 
 ### 8. 관측용 debugfs
 - /sys/kernel/debug/samon/lba_page_map: 엔트리별 lba, pfn, reads, writes, hot_r, hot_w
-- /sys/kernel/debug/samon/stats: rq_seen, seg_buffered, skip_null, skip_anon, skip_nomap(nomap_slab, nomap_flagged, nomap_meta, nomap_other, nomap_write), skip_pinned, skip_dev, budget_cut, mark_accessed, drop_full, drop_nomem, entries
+- /sys/kernel/debug/samon/stats: rq_seen, seg_buffered, skip_null, skip_anon, skip_nomap(nomap_slab, nomap_flagged, nomap_meta, nomap_other, nomap_write), skip_pinned, skip_dev, budget_cut, mark_accessed, drop_full, drop_nomem, entries. 값은 부팅 이후 누적이다.
 
 ## 검증 상태
 
-"검증됨"은 실제 커널에서 실행한 결과가 있는 항목만 해당한다.
+"검증됨"은 실제 커널에서 실행한 결과가 있는 항목만 해당한다. 환경은 VMware VM, ext4(/dev/sda2, 파티션 시작 섹터 4096, 블록 4096바이트), 메모리 8GB이며 커널 6.8.0-SAMON이다.
 
-### 검증됨 (2026-10-05, 커널 6.8.0-SAMON #8, verify_samon.sh 실행 결과 PASS 7 / FAIL 0)
+### 항목별 상태
 
-환경: VMware VM, ext4(/dev/sda2, 파티션 시작 섹터 4096, 블록 4096바이트), 디렉터리 /var/tmp/samon_verify.
-
-| 항목 | 방식 | 결과 |
+| 항목 | 상태 | 근거 (커널 빌드, 방식, 결과) |
 |---|---|---|
-| tracepoint 등록 및 stats 노출 | kdamond를 saddr로 켠 뒤 stats 파일 확인 | 정상 |
-| LBA와 파일 물리 위치 일치 | fio --direct=0 4MB write 후 sync. filefrag -e의 physical 블록을 (블록 크기 / 512)배하고 파티션 시작 섹터를 더해 섹터로 변환하여 lba_page_map과 비교 | 파일의 블록 시작 섹터 1024개 중 1024개 모두 존재 |
-| direct I/O 배제 | fio --direct=1 4MB write 후 sync. 해당 파일의 섹터 집합과 lba_page_map의 교집합 계산, stats의 skip 카운터 증가량 확인 | 교집합 0개, skip 카운터 +1024 (4MB / 4KB와 일치) |
-| hot 판정 | threshold(10) 이상 dd oflag=sync로 같은 위치에 반복 write 후 hot_w 확인 | hot_w=1 엔트리 확인 |
-| 윈도우 리셋 | 윈도우(1000ms) 경과 후 한 번 더 write, 같은 LBA의 writes 값 확인 | writes=1로 리셋됨 |
-| read/write 카운터 분리 | 2026-09-22 세션 로그(이전 버전) 및 이번 실행의 reads/writes 열 | 분리 동작 |
-| 부팅 및 모듈 로드 | 6.8.0-SAMON #8로 부팅, 부팅 로그에서 saddr ops 등록 확인 | 정상 |
+| tracepoint 등록, stats/debugfs 노출 | 검증됨 | #8 이후 매 실행 |
+| LBA와 파일 물리 위치 일치 | 검증됨 | 4MB buffered write 후 filefrag -e의 physical 블록을 섹터로 변환(블록 크기 / 512배 + 파티션 시작 섹터)해 lba_page_map과 비교, 1024개 중 1024개 일치 (#8, #9, #10 모두 동일) |
+| direct I/O 배제 (anon 경로) | 검증됨 | fio --direct=1 4MB write, 해당 파일 섹터와 맵의 교집합 0개, skip_anon +1024 |
+| direct I/O 배제 (pin 경로) | 검증됨 | test_pinned(mmap 소스 O_DIRECT 1MiB), skip_pinned +256, 대상 섹터 0개 (#9) |
+| hot 판정 | 검증됨 | threshold(10) 이상 반복 write 후 hot_w=1 |
+| 윈도우 리셋 | 검증됨 | 윈도우(1000ms) 경과 후 writes=1로 리셋 |
+| read/write 카운터 분리 | 검증됨 | reads/writes 열 확인 |
+| 옵션 B 토글 | 검증됨 | samon_opt_b=0이면 mark_accessed +0, 1이면 +6 (#9) |
+| 대상 디스크 필터 | 검증됨 | 존재하지 않는 디스크로 지정 시 rq_seen +0, skip_dev 증가. 실제 디스크(sda 8:0) 지정 시 관측됨 (#9) |
+| kdamond off/on 10회 반복 | 검증됨 | 매 stop마다 entries=0, 쓴 파일의 LBA별 writes 최댓값 1(probe 중복 등록 없음), 커널 경고(BUG/WARNING/Oops/lockdep/RCU stall/soft lockup) 없음 (#9) |
+| nomap 분류 카운터 일관성 | 검증됨 | 네 부류의 합이 skip_nomap과 일치 (#10) |
+| nomap_other의 정체 | 정황 근거로 판단 | REQ_OP_DRV_IN, sr 드라이버, 약 2초 주기 2건. 디바이스 이름 직접 확인은 못 함 |
+| 부분 완료(nr_bytes 반영) 경로 | **미검증** | 코드 반영, budget_cut=0으로 한 번도 실행되지 않음 |
+| 에러 completion 경로 | **미검증** | 코드에 early return이 있으나 에러 주입 실험을 하지 않았고, 에러 request를 세는 카운터도 아직 없음 |
+| 호출 컨텍스트 안전성 (6절 참조) | **미검증** | lockdep 등 검사 빌드로 확인한 적 없음 |
+| 고부하(fio 병렬) 락 경합과 오버헤드 | **미측정** | |
+| 장시간, 다중 CPU 동시성 | **미검증** | |
+| 옵션 B의 실제 효과 (refault, pgsteal, IOPS 변화) | **미측정** | 호출 on/off 토글만 준비됨 |
 
-실행 직후 stats:
+검증력에 대한 메모:
 
-```
-rq_seen=1406  seg_buffered=6164
-skip_null=0  skip_anon=1024  skip_nomap=8  skip_pinned=0
-drop_full=0  drop_nomem=0   entries=6120 (max 65536)
-```
-
-해석 시 주의할 점은 다음과 같다.
-
-- direct I/O 4MB write가 건너뛴 1024개 segment는 모두 skip_anon으로 분류되었다. 사용자 anon 버퍼를 쓰는 일반적인 direct I/O 경로는 검증되었다.
-- skip_pinned 경로(mmap한 파일 버퍼를 쓰는 direct I/O)는 이번 시험에서 한 번도 실행되지 않았다. 해당 경로는 코드만 있고 검증되지 않았다.
-- direct 시험 중 seg_buffered가 63 늘었다. 시스템 전체를 관측하므로 백그라운드 buffered I/O가 섞인 것이며, 그래서 검증은 총 개수가 아니라 특정 파일의 섹터 집합으로 비교한다.
-- skip_nomap=8은 page cache 매핑이 없는 segment이다. 어떤 I/O인지는 분류하지 않았다.
-- 각 항목은 1회 실행 결과이다. 반복 실행, 다른 파일시스템, 다른 워크로드에서의 재현은 확인하지 않았다.
-
-### 추가 검증 결과 (2026-10-05, 커널 6.8.0-SAMON #9, verify_samon.sh PASS 16 / FAIL 0)
-
-| 항목 | 결과 |
-|---|---|
-| skip_pinned 경로 | test_pinned(mmap 소스 O_DIRECT 1MiB) 후 skip_pinned +256(= 256 페이지와 일치), 대상 파일 섹터는 맵에 0개 |
-| 옵션 B 토글 | samon_opt_b=0이면 mark_accessed +0, 1이면 +6 |
-| 대상 디스크 필터 | 존재하지 않는 디스크로 지정: rq_seen +0, skip_dev +705. 실제 디스크(sda 8:0)로 지정: 관측됨 |
-| kdamond off/on 10회 | 매 stop마다 entries=0 확인, 커널 경고(BUG/WARNING/Oops/lockdep/RCU stall/soft lockup) 없음 |
-| 부분 완료 경로 | budget_cut=0 이므로 이 경로는 한 번도 실행되지 않았다. 코드는 반영됐지만 동작은 검증되지 않았다 |
-
-검증력 관련 메모와 미해결 관찰:
-
-- probe 중복 등록 없음: 수정된 판정(쓴 파일 LBA별 writes 최댓값이 1인지)으로 재실행하여 kdamond off/on 10회 모두 최댓값 1, 즉 한 번 쓴 블록이 한 번만 집계됨을 확인했다(PASS 16 / FAIL 0, 두 번째 실행). 처음 실행에서 쓴 seg_buffered 증가량 비교는 배경 I/O가 섞여 구분력이 없었으므로 그 결과는 근거로 쓰지 않는다.
-- skip_nomap이 크게 늘었다(첫 실행 8, #9 첫 실행 후 35686, 재실행 후 41999. stats는 부팅 이후 누적값이며 재실행 사이에 약 6300 증가). address_space가 없는 segment가 대량 발생했다는 뜻이며, 어떤 I/O인지(저널 등 파일시스템 내부 I/O로 추정되나 확인하지 않음) 분류하지 않았다.
-- 옵션 B 시험은 hot write 반복 파일 1개씩의 결과이고, 실행 간 mark_accessed 값(+6)은 워크로드에 따라 달라진다.
-
-### 검증되지 않은 항목
-
-| 항목 | 상태 |
-|---|---|
-| 부분 완료(nr_bytes 반영) 경로의 정확성 | 코드 반영, budget_cut 카운터가 실제로 증가하는 워크로드는 아직 찾지 못함 |
-| 고부하(fio 병렬)에서의 락 경합과 오버헤드 | 미측정 |
-| 에러 주입(completion error) 경로 | 미실행 |
-| 장시간, 다중 CPU 동시성 | 미검증 |
-| 옵션 B의 실제 효과(refault, pgsteal, IOPS 변화) | 미측정. 호출 on/off 토글만 준비됨 |
+- 각 항목은 1회 또는 소수 회 실행 결과이다. 다른 파일시스템, 다른 워크로드에서의 재현은 확인하지 않았다.
+- 시스템 전체를 관측하므로 백그라운드 I/O가 섞인다. 그래서 검증은 총 개수가 아니라 특정 파일의 섹터 집합이나 LBA별 카운터로 판정한다. 총량(seg_buffered) 증가량 비교는 구분력이 없어 판정에 쓰지 않는다.
+- 옵션 B 토글 시험은 백그라운드의 같은 LBA 반복 write가 mark_accessed를 호출하면 off 항목이 오탐 FAIL이 될 수 있다. FAIL 시 재실행해서 확인한다.
 
 ### 검증 실행 방법
 ```bash
 sudo bash verify_samon.sh /var/tmp/samon_verify
 ```
-tmpfs가 아닌 실제 디스크 위의 디렉터리를 지정해야 한다. 결과는 PASS/FAIL로 출력된다.
+tmpfs가 아닌 실제 디스크 위의 디렉터리를 지정해야 한다. 마지막 줄에 PASS/FAIL 개수가 출력된다. nomap 분류 부분(섹션 8)은 부류별 개수를 보고만 하고 정체를 판정하지 않는다.
 
-## 빌드 시 주의 (6.8.0-SAMON 커널)
+### 실행 기록
 
-- 이 커널은 CONFIG_DEBUG_INFO_BTF_MODULES=y이다. saddr.c를 고쳐 vmlinux만 다시 빌드하면 모듈의 BTF와 vmlinux의 BTF가 어긋나, CONFIG_MODULE_ALLOW_BTF_MISMATCH가 꺼져 있을 때 모듈 로드가 거부된다. 디스크 드라이버(mptspi 등)가 모듈이면 initramfs에서 루트 디스크를 찾지 못해 부팅이 실패한다.
-- 이 때문에 .config에 CONFIG_MODULE_ALLOW_BTF_MISMATCH=y를 설정했다. 부팅 로그에 BTF mismatch 경고가 한 번 출력되는 것은 정상이다.
-- vmlinux 링크 단계의 BTF 생성(pahole)은 약 4.7GB 메모리를 쓴다. 메모리 4GB VM에서는 OOM으로 빌드가 실패하거나 VM이 멈췄다. 8GB에서는 성공했고 빌드 중 전체 사용량 최대는 약 7GB였다. 병렬 옵션(-j)을 빼려면 make에 PAHOLE_FLAGS를 지정한다.
-- modules_install은 INSTALL_MOD_STRIP=1로 하면 모듈과 initrd 크기가 줄어든다.
+| 날짜 | 커널 | 결과 |
+|---|---|---|
+| 2026-09-22 | 구버전 (세션 로그) | 기본 동작 확인. direct 배제와 LBA 정밀 대조는 근거 부족으로 이후 재검증 |
+| 2026-10-05 | #8 | verify_samon.sh 7개 항목 PASS |
+| 2026-10-05 | #9 | 16개 항목 PASS (skip_pinned, 옵션 B 토글, 디스크 필터, kdamond 반복, probe 중복 검사 포함) |
+| 2026-10-05 | #10 | nomap 분류 합 일치 PASS. nomap_meta 가설은 기각. 총 17 PASS |
 
 ## 측정 하네스 (bench/, 준비됨, 아직 커널에서 실행하지 않음)
 
@@ -192,14 +186,34 @@ tmpfs가 아닌 실제 디스크 위의 디렉터리를 지정해야 한다. 결
 - 검증되지 않은 것: 실제 SAMON 커널에서의 실행, 메모리 압박 설정의 적절성(워킹셋 대비 한도), 반복 횟수 5의 충분성. summarize.py의 판정 규칙은 대략적 선별 기준이며 유의성 검정이 아니다.
 - pgbench는 이 VM에 설치되어 있지 않아 첫 하네스는 fio 기반이다.
 
+## 빌드 시 주의 (6.8.0-SAMON 커널)
+
+- 이 커널은 CONFIG_DEBUG_INFO_BTF_MODULES=y이다. saddr.c를 고쳐 vmlinux만 다시 빌드하면 모듈의 BTF와 vmlinux의 BTF가 어긋나, CONFIG_MODULE_ALLOW_BTF_MISMATCH가 꺼져 있을 때 모듈 로드가 거부된다. 디스크 드라이버(mptspi 등)가 모듈이면 initramfs에서 루트 디스크를 찾지 못해 부팅이 실패한다.
+- 이 때문에 .config에 CONFIG_MODULE_ALLOW_BTF_MISMATCH=y를 설정했다. 부팅 로그에 BTF mismatch 경고가 한 번 출력되는 것은 정상이다.
+- vmlinux 링크 단계의 BTF 생성(pahole)은 약 4.7GB 메모리를 쓴다. 메모리 4GB VM에서는 OOM으로 빌드가 실패하거나 VM이 멈췄다. 8GB에서는 성공했고 빌드 중 전체 사용량 최대는 약 7GB였다. pahole 병렬 옵션(-j)을 빼려면 make에 PAHOLE_FLAGS="--btf_gen_floats --lang_exclude=rust --skip_encoding_btf_inconsistent_proto --btf_gen_optimized"를 지정한다.
+- saddr는 빌트인이라 수정 후 재부팅이 필요하다. 모듈 트리(/lib/modules/6.8.0-SAMON)가 이미 완전하면 modules_install은 다시 할 필요가 없다. modules_install을 할 때는 INSTALL_MOD_STRIP=1을 쓰면 모듈과 initrd 크기가 줄어든다.
+- 설치 전에 bzImage의 빌드 번호, vmlinux의 .BTF 섹션 존재, 빌드 로그에 Killed/Error가 없음을 확인한다.
+
 ## 알려진 한계
 
-- 시스템 전체의 buffered I/O를 관측한다. 백그라운드 I/O가 섞이므로 검증은 총 엔트리 수가 아니라 특정 파일의 섹터 집합으로 비교한다.
+- 시스템 전체의 buffered I/O를 관측한다. 대상 디스크 필터로 좁힐 수 있다.
+- 이 방식은 디스크 I/O가 발생한 page만 볼 수 있다. 캐시 히트인 page는 I/O가 없어 관측되지 않으므로, 캐시에 남아 있는 page를 대상으로 한 정책(오래 안 쓰인 page를 evict 우선 등)은 이 방식으로 구현할 수 없다.
 - direct I/O 판별은 folio 상태 기반이다. bio 플래그나 IOCB_DIRECT 같은 상위 컨텍스트는 block layer에서 접근할 수 없어 사용하지 않았다.
 - debugfs 출력은 트리 순회 동안 spinlock을 잡는다. samon_max_entries로 상한을 두었지만 엔트리가 매우 많으면 조회 중 지연이 생길 수 있다.
-- 콜백에서 segment마다 spinlock을 잡는다. 고부하에서의 오버헤드는 아직 측정하지 않았다.
+- 콜백에서 segment마다 전역 spinlock을 잡는다. 고부하에서의 오버헤드는 아직 측정하지 않았다.
 - 옵션 A/B/C 중 B를 기본 적용했으나, 확정은 사용자 결정 사항이다.
+
+## 남은 개발 (제안, 아직 문서로 확정되지 않음)
+
+최종 목표(커널 내 bio to page 직접 조작)를 위해 필요하다고 판단한 항목이며, 순서와 범위는 사용자 확인 후 확정한다.
+
+1. 조작 컨텍스트 안전화: 콜백은 기록만 하고 조작은 프로세스 컨텍스트로 지연 실행
+2. 영역 단위 집계와 패턴 분류 (순차, 랜덤, 반복, 증가/감소 추세)
+3. 정책 판단 (분류 결과에 따른 promote/유지/demote, 불확실하면 기본 LRU로 폴백)
+4. 조작 프리미티브 확장 (promote, demote, read 쪽 조작), 각각 토글과 카운터 필수
+5. 효과 측정 (하네스 실행, 기본 LRU 대비 비교)
+6. 안정성과 오버헤드 (에러 주입, 부분 완료 재현, 고부하, 장시간, 락 구조 판단)
 
 ## 범위 밖 (후순위)
 
-점수 등급 체계(+++, ++, --, ---), DAMOS scheme 연동, DAMON/SAMON 비교 실험은 이 단계에서 구현하지 않았다.
+점수 등급 체계(+++, ++, --, ---), DAMOS scheme 연동, DAMON/SAMON 통합 비교 실험은 구현하지 않았다. 사용자가 명시적으로 지시하기 전까지 착수하지 않는다.
