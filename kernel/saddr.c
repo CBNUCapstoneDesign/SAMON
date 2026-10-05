@@ -50,6 +50,21 @@ module_param(samon_window_ms, uint, 0644);
 MODULE_PARM_DESC(samon_window_ms,
 	"Observation window in milliseconds for hot-region detection");
 
+static bool samon_opt_b = true;
+module_param(samon_opt_b, bool, 0644);
+MODULE_PARM_DESC(samon_opt_b,
+	"Option B: call folio_mark_accessed() on hot write completion");
+
+static unsigned int samon_dev_major;
+module_param(samon_dev_major, uint, 0644);
+MODULE_PARM_DESC(samon_dev_major,
+	"Observe only this whole disk (major); 0 = observe all devices");
+
+static unsigned int samon_dev_minor;
+module_param(samon_dev_minor, uint, 0644);
+MODULE_PARM_DESC(samon_dev_minor,
+	"Observe only this whole disk (first_minor), used with samon_dev_major");
+
 static unsigned int samon_max_entries = 65536;
 module_param(samon_max_entries, uint, 0644);
 MODULE_PARM_DESC(samon_max_entries,
@@ -101,6 +116,9 @@ static atomic64_t samon_st_skip_nomap;	/* no address_space                */
 static atomic64_t samon_st_skip_pinned;	/* DMA-pinned (direct I/O)         */
 static atomic64_t samon_st_drop_full;	/* tree at samon_max_entries       */
 static atomic64_t samon_st_drop_nomem;	/* GFP_ATOMIC failure              */
+static atomic64_t samon_st_skip_dev;	/* request on a non-target disk    */
+static atomic64_t samon_st_budget_cut;	/* partial completion (< rq bytes) */
+static atomic64_t samon_st_mark_accessed;/* folio_mark_accessed() calls    */
 
 /* debugfs */
 static struct dentry *samon_dbgfs_dir;
@@ -221,7 +239,14 @@ static struct folio *samon_segment_folio(struct bio_vec *bv)
 /* Core bio handler                                                    */
 /* ------------------------------------------------------------------ */
 
-static void samon_handle_bio(struct bio *bio, int dir)
+/*
+ * @budget: bytes completed by this block_rq_complete event.  The tracepoint
+ * fires before bio_advance(), once per (possibly partial) completion, and
+ * the bios still hanging off the request reflect only the not-yet-completed
+ * part.  Walking only @budget bytes avoids counting a segment again when the
+ * request completes in several steps.  Returns true once @budget is used up.
+ */
+static bool samon_handle_bio(struct bio *bio, int dir, unsigned int *budget)
 {
 	struct bio_vec bv;
 	struct bvec_iter iter;
@@ -233,6 +258,10 @@ static void samon_handle_bio(struct bio *bio, int dir)
 		struct folio *folio;
 		struct samon_lba_entry *entry;
 		bool hot;
+
+		if (!*budget)
+			return true;
+		*budget -= min(*budget, bv.bv_len);
 
 		folio = samon_segment_folio(&bv);
 		if (!folio)
@@ -273,15 +302,20 @@ static void samon_handle_bio(struct bio *bio, int dir)
 		/*
 		 * Option B: on hot write completion, call folio_mark_accessed()
 		 * so that the next evict scan is less likely to reclaim this
-		 * page.  For reads the kernel already marks the page accessed
-		 * during I/O completion, so we only act on writes here.
+		 * page.  Reads are observation-only at this stage: whether a
+		 * read-side hint helps is to be decided by measurement.
+		 * Toggle with samon_opt_b to compare on/off.
 		 */
-		if (hot && dir == WRITE)
+		if (hot && dir == WRITE && READ_ONCE(samon_opt_b)) {
 			folio_mark_accessed(folio);
+			atomic64_inc(&samon_st_mark_accessed);
+		}
 
 next_seg:
 		lba += bv.bv_len >> SECTOR_SHIFT;
 	}
+
+	return !*budget;
 }
 
 /* ------------------------------------------------------------------ */
@@ -295,6 +329,7 @@ static void damon_sa_bio_trace(void *data, struct request *rq,
 	unsigned long sector;
 	int lo, hi, mid;
 	unsigned int nr;
+	unsigned int budget;
 	int dir;
 
 	/* Skip failed completions entirely */
@@ -305,6 +340,15 @@ static void damon_sa_bio_trace(void *data, struct request *rq,
 		return;
 
 	dir = rq_data_dir(rq); /* READ or WRITE */
+	if (READ_ONCE(samon_dev_major)) {
+		struct gendisk *disk = rq->q ? rq->q->disk : NULL;
+
+		if (!disk || disk->major != READ_ONCE(samon_dev_major) ||
+		    disk->first_minor != READ_ONCE(samon_dev_minor)) {
+			atomic64_inc(&samon_st_skip_dev);
+			return;
+		}
+	}
 	atomic64_inc(&samon_st_rq_seen);
 
 	/*
@@ -333,8 +377,13 @@ static void damon_sa_bio_trace(void *data, struct request *rq,
 	}
 
 	/* ---- New path: LBA->page mapping + frequency tracking ---- */
-	__rq_for_each_bio(bio, rq)
-		samon_handle_bio(bio, dir);
+	if (nr_bytes < blk_rq_bytes(rq))
+		atomic64_inc(&samon_st_budget_cut);
+	budget = nr_bytes;
+	__rq_for_each_bio(bio, rq) {
+		if (samon_handle_bio(bio, dir, &budget))
+			break;
+	}
 }
 
 /* ------------------------------------------------------------------ */
@@ -506,6 +555,12 @@ static int samon_stats_show(struct seq_file *m, void *v)
 		   (long long)atomic64_read(&samon_st_drop_full));
 	seq_printf(m, "drop_nomem=%lld\n",
 		   (long long)atomic64_read(&samon_st_drop_nomem));
+	seq_printf(m, "skip_dev=%lld\n",
+		   (long long)atomic64_read(&samon_st_skip_dev));
+	seq_printf(m, "budget_cut=%lld\n",
+		   (long long)atomic64_read(&samon_st_budget_cut));
+	seq_printf(m, "mark_accessed=%lld\n",
+		   (long long)atomic64_read(&samon_st_mark_accessed));
 	seq_printf(m, "entries=%u max_entries=%u\n", nr, samon_max_entries);
 	return 0;
 }

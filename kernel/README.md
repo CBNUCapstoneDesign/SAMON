@@ -12,6 +12,7 @@ eBPF 기반 유저스페이스 스크립트(samon_probe.py, samon_monitor.py 등
 | damon_Makefile | mm/damon/Makefile 대체본 (CONFIG_DAMON_SADDR 추가) |
 | damon_Kconfig | mm/damon/Kconfig 대체본 (CONFIG_DAMON_SADDR 추가) |
 | verify_samon.sh | 기능 검증 스크립트 (root 권한, 재부팅 후 실행) |
+| test_pinned.c | verify_samon.sh가 컴파일해서 쓰는 테스트. mmap한 파일 페이지를 소스로 하는 O_DIRECT write |
 
 ## 적용 방법
 
@@ -42,6 +43,8 @@ cat /sys/kernel/debug/samon/stats
 | samon_hot_threshold | 10 | 윈도우 안에서 이 횟수 이상 발생하면 hot으로 판정 |
 | samon_window_ms | 1000 | 빈도수를 세는 관측 윈도우(ms) |
 | samon_max_entries | 65536 | LBA 트리에 보관하는 엔트리 상한 (메모리 상한) |
+| samon_opt_b | 1 | 옵션 B 토글. 0이면 hot write에서도 folio_mark_accessed()를 호출하지 않는다 (효과 비교용) |
+| samon_dev_major, samon_dev_minor | 0, 0 | 관측 대상 디스크(whole disk의 major, first_minor). major가 0이면 모든 디바이스를 관측한다 |
 
 ## 구현된 기능
 
@@ -49,6 +52,8 @@ cat /sys/kernel/debug/samon/stats
 - block_rq_complete tracepoint를 register_trace_block_rq_complete()로 구독한다.
 - 완료 에러(error != 0)인 request는 관측에서 제외한다.
 - rq_data_dir()로 READ/WRITE를 구분한다.
+- 부분 완료 처리: 이 tracepoint는 blk_update_request() 맨 앞에서 bio_advance()/bio_endio() 이전에 발화하며, request가 여러 번에 나뉘어 완료되면 그때마다 발화한다. 콜백은 nr_bytes만큼의 segment만 순회해서 같은 segment를 중복 집계하지 않는다. nr_bytes가 request 전체보다 작았던 횟수는 stats의 budget_cut에 기록한다.
+- 대상 디스크 필터(samon_dev_major/minor)에 맞지 않는 request는 skip_dev로 세고 건너뛴다.
 
 ### 2. bio에서 page 추출
 - request에 연결된 bio를 __rq_for_each_bio()로 순회하고, bio_for_each_segment()로 bi_io_vec의 각 segment에 접근한다.
@@ -77,7 +82,8 @@ cat /sys/kernel/debug/samon/stats
 
 ### 6. 옵션 B (미래 접근 예측 반영)
 - hot으로 판정된 write completion에서 folio_mark_accessed()를 호출한다. 기존 커널 API만 사용하며 커널 소스는 수정하지 않는다.
-- read는 커널이 이미 accessed 처리를 하므로 조작하지 않고 관측만 한다.
+- read는 이 단계에서 관측만 하며, read 시점 힌트의 효과는 측정으로 판단할 사안으로 남겨 둔다. 이전 버전의 "read는 커널이 이미 accessed 처리를 한다"는 주석은 근거가 부족하여 제거했다. read 완료 시점의 page는 LRU에 올라가 있지만 사용자 접근 전이다.
+- samon_opt_b 파라미터로 호출을 끌 수 있어, 켠 경우와 끈 경우를 같은 워크로드로 비교할 수 있다. 호출 횟수는 stats의 mark_accessed에 기록한다.
 
 ### 7. 안정성 보강 (이번에 추가)
 - kdamond를 재시작해도 tracepoint가 중복 등록되지 않도록 등록 상태 플래그를 둔다.
@@ -86,7 +92,7 @@ cat /sys/kernel/debug/samon/stats
 
 ### 8. 관측용 debugfs
 - /sys/kernel/debug/samon/lba_page_map: 엔트리별 lba, pfn, reads, writes, hot_r, hot_w
-- /sys/kernel/debug/samon/stats: rq_seen, seg_buffered, skip_null, skip_anon, skip_nomap, skip_pinned, drop_full, drop_nomem, entries
+- /sys/kernel/debug/samon/stats: rq_seen, seg_buffered, skip_null, skip_anon, skip_nomap, skip_pinned, skip_dev, budget_cut, mark_accessed, drop_full, drop_nomem, entries
 
 ## 검증 상태
 
@@ -122,15 +128,26 @@ drop_full=0  drop_nomem=0   entries=6120 (max 65536)
 - skip_nomap=8은 page cache 매핑이 없는 segment이다. 어떤 I/O인지는 분류하지 않았다.
 - 각 항목은 1회 실행 결과이다. 반복 실행, 다른 파일시스템, 다른 워크로드에서의 재현은 확인하지 않았다.
 
+### 코드는 반영되었으나 아직 실행 검증하지 않은 항목 (verify_samon.sh 섹션 4~7에 포함)
+
+| 항목 | 검증 방식 | 통과 기준 |
+|---|---|---|
+| skip_pinned 경로 | test_pinned로 1MiB를 mmap 소스 O_DIRECT write 후 skip_pinned 증가량 확인, 대상 파일 섹터가 lba_page_map에 없는지 확인 | skip_pinned가 230 이상 증가, 섹터 0개 |
+| 옵션 B 토글 | samon_opt_b를 0과 1로 바꿔 각각 hot write 반복, mark_accessed 증가량 비교 | 0이면 증가 0, 1이면 증가 |
+| 대상 디스크 필터 | 존재하지 않는 디스크로 필터 후 I/O(rq_seen 증가 없음, skip_dev 증가), 실제 디스크로 필터 후 I/O(rq_seen 증가) | 두 조건 충족 |
+| kdamond off/on 10회 반복 | 매번 stop 후 entries가 0인지, 같은 I/O의 seg_buffered 증가량이 회차 간 유지되는지(probe 중복 등록 없음), dmesg에 BUG/WARNING/Oops/lockdep 없는지 | 모두 충족 |
+
+참고: 옵션 B 토글 시험은 백그라운드의 같은 LBA 반복 write(예: 파일시스템 저널)가 mark_accessed를 호출하면 off 항목이 오탐 FAIL이 될 수 있다. FAIL 시 재실행하여 확인한다.
+
 ### 검증되지 않은 항목
 
 | 항목 | 상태 |
 |---|---|
-| skip_pinned 경로 (mmap 파일 버퍼를 쓰는 direct I/O) | 미실행 |
+| 부분 완료(nr_bytes 반영) 경로의 정확성 | 코드 반영, budget_cut 카운터가 실제로 증가하는 워크로드는 아직 찾지 못함 |
 | 고부하(fio 병렬)에서의 락 경합과 오버헤드 | 미측정 |
 | 에러 주입(completion error) 경로 | 미실행 |
-| 동시성 안전성(장시간, 다중 CPU) | 미검증 |
-| 옵션 B의 실제 효과(evict 스캔에서 skip되는지) | 미측정. 호출만 하며 효과는 확인하지 않음 |
+| 장시간, 다중 CPU 동시성 | 미검증 |
+| 옵션 B의 실제 효과(refault, pgsteal, IOPS 변화) | 미측정. 호출 on/off 토글만 준비됨 |
 
 ### 검증 실행 방법
 ```bash
