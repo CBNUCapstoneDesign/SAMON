@@ -36,7 +36,10 @@ for k in metrics:
     d_BB = pct(mean("on_B", k), mean("on_noB", k)) if "on_B" in data and "on_noB" in data else float("nan")
     noise = pct(mean("off2", k), base) if "off2" in data else float("nan")
     verdict = "n/a"
-    if "on_B" in data and "on_noB" in data:
+    n_min = min(len(data[m][k]) for m in ("on_B", "on_noB", "off", "off2") if m in data)
+    if n_min < 3:
+        verdict = f"not judged (n={n_min} < 3)"
+    elif "on_B" in data and "on_noB" in data:
         delta = abs(mean("on_B", k) - mean("on_noB", k))
         floor = max(abs(mean("off2", k) - base) if "off2" in data else 0,
                     2 * max(sd("on_noB", k), sd("on_B", k)))

@@ -42,13 +42,16 @@ CSV=$OUT/runs.csv
 st_get() { awk -F= -v k="$1" '$1==k{print $2+0}' $DBG/stats 2>/dev/null || echo 0; }
 vm_get() { awk -v k="$1" '$1==k{print $2}' /proc/vmstat; }
 VMKEYS="pgpgin pgpgout pgsteal_file pgsteal_kswapd pgsteal_direct pgscan_kswapd pgscan_direct pgactivate pgdeactivate workingset_refault_file workingset_activate_file"
-STKEYS="rq_seen seg_buffered mark_accessed skip_dev"
+STKEYS="rq_seen seg_buffered mark_accessed skip_dev skip_anon skip_nomap skip_pinned drop_full drop_nomem"
+CGKEYS="pgscan pgsteal pgactivate pgdeactivate workingset_refault_file workingset_activate_file"
 
 wait_state() { for _ in $(seq 1 50); do [ "$(cat $KD/0/state)" = "$1" ] && return 0; sleep 0.2; done; return 1; }
 set_mode() {
   [ $DRY = 1 ] && return 0
   case $1 in
-    off|off2) echo off > $KD/0/state; wait_state off || { echo "kdamond stop failed"; exit 1; } ;;
+    off|off2)
+      # writing "off" to an already stopped kdamond fails with EPERM; only stop if running
+      [ "$(cat $KD/0/state)" = off ] || { echo off > $KD/0/state; wait_state off || { echo "kdamond stop failed"; exit 1; }; } ;;
     on_noB|on_B)
       [ "$(cat $KD/0/state)" = on ] || { echo on > $KD/0/state; wait_state on || { echo "kdamond start failed"; exit 1; }; }
       [ $1 = on_B ] && echo 1 > $PARM/samon_opt_b || echo 0 > $PARM/samon_opt_b
@@ -74,8 +77,8 @@ fi
 
 # prefill outside the cgroup so the files exist on disk
 echo "prefill..."
-fio --name=fill_hot --filename=$DIR/hot.dat --size=$HOT --rw=write --bs=1M --direct=0 --end_fsync=1 --output=/dev/null
-[ "$WL" = mixed ] && fio --name=fill_scan --filename=$DIR/scan.dat --size=$SCAN --rw=write --bs=1M --direct=0 --end_fsync=1 --output=/dev/null
+fio --name=fill_hot --filename=$DIR/hot.dat --size=$HOT --rw=write --bs=1M --direct=0 --end_fsync=1 --eta=never --output=/dev/null
+[ "$WL" = mixed ] && fio --name=fill_scan --filename=$DIR/scan.dat --size=$SCAN --rw=write --bs=1M --direct=0 --end_fsync=1 --eta=never --output=/dev/null
 
 jobfile() {
   cat <<JOB
@@ -109,7 +112,7 @@ JOB
   fi
 }
 
-echo "run,mode,rep,hot_r_iops,hot_w_iops,hot_r_p99_us,hot_w_p99_us,scan_bw_kib,$(echo $VMKEYS | tr ' ' ','),$(echo $STKEYS | tr ' ' ',')" > $CSV
+echo "run,mode,rep,hot_r_iops,hot_w_iops,hot_r_p99_us,hot_w_p99_us,scan_bw_kib,$(echo $VMKEYS | tr ' ' ','),$(echo $STKEYS | tr ' ' ','),$(for k in $CGKEYS; do printf 'cg_%s,' $k; done | sed 's/,$//')" > $CSV
 RUN=0
 for rep in $(seq 1 $REPS); do
   for mode in $(echo $MODES | tr ' ' '\n' | shuf); do
@@ -125,6 +128,8 @@ for rep in $(seq 1 $REPS); do
     else
       mkdir -p $CG; echo $MEM > $CG/memory.max; echo 0 > $CG/memory.swap.max
       bash -c "echo \$\$ > $CG/cgroup.procs; exec fio $OUT/job.fio --output-format=json --output=$OUT/run$RUN.json" >/dev/null 2>&1
+      # global pgscan/pgsteal do not count memcg-limit reclaim, so read the cgroup's own counters
+      CGD=""; for k in $CGKEYS; do CGD="$CGD,$(awk -v k=$k '$1==k{print $2}' $CG/memory.stat)"; done
       rmdir $CG 2>/dev/null
     fi
     ROW=$(python3 - "$OUT/run$RUN.json" <<'PY'
@@ -146,7 +151,8 @@ PY
     VD=""; for k in $VMKEYS; do VD="$VD,$(( $(vm_get $k) - ${V0[$k]} ))"; done
     SD=""; for k in $STKEYS; do
       if [ $DRY = 0 ] && [ "${mode#on}" != "$mode" ]; then SD="$SD,$(( $(st_get $k) - ${S0[$k]} ))"; else SD="$SD,0"; fi; done
-    echo "$RUN,$mode,$rep,$ROW$VD$SD" >> $CSV
+    [ $DRY = 1 ] && CGD=",0,0,0,0,0,0"
+    echo "$RUN,$mode,$rep,$ROW$VD$SD$CGD" >> $CSV
   done
 done
 python3 "$HERE/summarize.py" "$CSV" | tee "$OUT/summary.md"
