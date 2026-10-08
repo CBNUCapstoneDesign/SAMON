@@ -9,6 +9,9 @@
  *  - folio_mark_accessed() hint on hot write completions (Option B)
  *  - debugfs interface: /sys/kernel/debug/samon/lba_page_map
  *
+ * Direct I/O is excluded per segment (anon / no mapping / DMA-pinned
+ * folio), and every skip reason is counted in /sys/kernel/debug/samon/stats.
+ *
  * Author: Sangsoo Park, Sumin Sim
  */
 
@@ -25,6 +28,7 @@
 #include <linux/swap.h>      /* folio_mark_accessed */
 #include <linux/pagemap.h>   /* page_mapping, page_folio */
 #include <linux/jiffies.h>
+#include <linux/mm.h>        /* folio_maybe_dma_pinned */
 
 #include <trace/events/block.h>
 
@@ -45,6 +49,31 @@ static unsigned int samon_window_ms = 1000;
 module_param(samon_window_ms, uint, 0644);
 MODULE_PARM_DESC(samon_window_ms,
 	"Observation window in milliseconds for hot-region detection");
+
+static bool samon_opt_b = true;
+module_param(samon_opt_b, bool, 0644);
+MODULE_PARM_DESC(samon_opt_b,
+	"Option B: call folio_mark_accessed() on hot write completion");
+
+static unsigned int samon_dev_major;
+module_param(samon_dev_major, uint, 0644);
+MODULE_PARM_DESC(samon_dev_major,
+	"Observe only this whole disk (major); 0 = observe all devices");
+
+static unsigned int samon_dev_minor;
+module_param(samon_dev_minor, uint, 0644);
+MODULE_PARM_DESC(samon_dev_minor,
+	"Observe only this whole disk (first_minor), used with samon_dev_major");
+
+static unsigned int samon_dbg_nomap;
+module_param(samon_dbg_nomap, uint, 0644);
+MODULE_PARM_DESC(samon_dbg_nomap,
+	"Log no-mapping segments of the unexplained class (nomap_other) to dmesg while the cumulative nomap_other count is <= this value (0 = off)");
+
+static unsigned int samon_max_entries = 65536;
+module_param(samon_max_entries, uint, 0644);
+MODULE_PARM_DESC(samon_max_entries,
+	"Upper bound on LBA entries kept in the tree (bounds memory use)");
 
 /* ------------------------------------------------------------------ */
 /* Per-LBA entry stored in an rbtree                                   */
@@ -78,6 +107,29 @@ static DEFINE_MUTEX(sa_ctx_lock);
 /* rbtree for LBA->page mapping and frequency tracking */
 static struct rb_root samon_lba_tree = RB_ROOT;
 static DEFINE_SPINLOCK(samon_lba_lock);
+static unsigned int samon_nr_entries;	/* protected by samon_lba_lock */
+
+/* tracepoint registration state (protected by sa_ctx_lock) */
+static bool samon_probe_registered;
+
+/* Observation statistics: lockless, only for verification/debugging */
+static atomic64_t samon_st_rq_seen;	/* completed requests (no error) */
+static atomic64_t samon_st_seg_buffered;/* segments recorded               */
+static atomic64_t samon_st_skip_null;	/* bv_page == NULL                 */
+static atomic64_t samon_st_skip_anon;	/* anon/swapcache folio            */
+static atomic64_t samon_st_skip_nomap;	/* no address_space                */
+static atomic64_t samon_st_skip_pinned;	/* DMA-pinned (direct I/O)         */
+static atomic64_t samon_st_drop_full;	/* tree at samon_max_entries       */
+static atomic64_t samon_st_drop_nomem;	/* GFP_ATOMIC failure              */
+/* breakdown of skip_nomap (the four below always sum to skip_nomap) */
+static atomic64_t samon_st_nomap_slab;	/* slab-backed buffer              */
+static atomic64_t samon_st_nomap_flagged;/* mapping has movable/ksm flags   */
+static atomic64_t samon_st_nomap_meta;	/* mapping==NULL, REQ_META set     */
+static atomic64_t samon_st_nomap_other;	/* mapping==NULL, REQ_META clear   */
+static atomic64_t samon_st_nomap_write;	/* nomap segments of WRITE (all)   */
+static atomic64_t samon_st_skip_dev;	/* request on a non-target disk    */
+static atomic64_t samon_st_budget_cut;	/* partial completion (< rq bytes) */
+static atomic64_t samon_st_mark_accessed;/* folio_mark_accessed() calls    */
 
 /* debugfs */
 static struct dentry *samon_dbgfs_dir;
@@ -106,10 +158,17 @@ static struct samon_lba_entry *samon_lba_get_or_insert(sector_t lba)
 			return entry;	/* found */
 	}
 
+	if (samon_nr_entries >= samon_max_entries) {
+		atomic64_inc(&samon_st_drop_full);
+		return NULL;
+	}
+
 	/* Allocate new entry — use GFP_ATOMIC: we may be in IRQ context */
 	entry = kmalloc(sizeof(*entry), GFP_ATOMIC);
-	if (!entry)
+	if (!entry) {
+		atomic64_inc(&samon_st_drop_nomem);
 		return NULL;
+	}
 
 	entry->lba          = lba;
 	entry->pfn          = 0;
@@ -119,6 +178,7 @@ static struct samon_lba_entry *samon_lba_get_or_insert(sector_t lba)
 
 	rb_link_node(&entry->node, parent, link);
 	rb_insert_color(&entry->node, &samon_lba_tree);
+	samon_nr_entries++;
 
 	return entry;
 }
@@ -137,75 +197,114 @@ static void samon_lba_tree_free(void)
 		rb_erase(&e->node, &samon_lba_tree);
 		kfree(e);
 	}
+	samon_nr_entries = 0;
 	spin_unlock_irqrestore(&samon_lba_lock, flags);
 }
 
 /* ------------------------------------------------------------------ */
-/* direct-I/O detection                                                */
+/* buffered / direct I/O discrimination (per segment)                  */
 /* ------------------------------------------------------------------ */
 
 /*
- * At the block layer we identify direct I/O by checking whether the bio
- * has no page-cache mapping on any of its pages.  A simpler and cheaper
- * heuristic is to check bi_opf for REQ_SYNC together with the absence
- * of a page-cache address_space.  We use the page-mapping check because
- * it is definitive: if page_mapping(page) is NULL the page does not
- * belong to the page cache, so we skip it regardless of origin.
+ * A segment is treated as buffered (page-cache) I/O only if its folio:
+ *   - exists (bv_page != NULL),
+ *   - is not anonymous / swap cache (anon pages are user buffers handed to
+ *     direct I/O, or swap I/O),
+ *   - has an address_space (page cache or block-device buffer cache),
+ *   - is not DMA-pinned.  Direct I/O pins the user buffer with
+ *     pin_user_pages(), so a file-backed (mmap) buffer used for direct I/O
+ *     is still rejected here; page-cache folios in buffered I/O are not
+ *     pinned by the I/O path.
  *
- * The function returns true when the entire bio looks like direct I/O
- * (first segment has no page-cache mapping).
+ * Returns the folio on success, NULL when the segment must be skipped.
+ * Every skip reason is counted so the filter can be verified from userspace.
  */
-static bool samon_bio_is_direct(struct bio *bio)
+static void samon_classify_nomap(struct bio *bio, struct folio *folio, int dir)
 {
-	struct bio_vec bv;
-	struct bvec_iter iter;
+	unsigned long raw = (unsigned long)READ_ONCE(folio->mapping);
 
-	bio_for_each_segment(bv, bio, iter) {
-		struct page *page = bv.bv_page;
+	atomic64_inc(&samon_st_skip_nomap);
+	if (dir == WRITE)
+		atomic64_inc(&samon_st_nomap_write);
 
-		if (!page)
-			return true;  /* no page → direct or metadata I/O */
+	if (folio_test_slab(folio)) {
+		atomic64_inc(&samon_st_nomap_slab);
+	} else if (raw & PAGE_MAPPING_FLAGS) {
+		atomic64_inc(&samon_st_nomap_flagged);
+	} else if (bio->bi_opf & REQ_META) {
+		atomic64_inc(&samon_st_nomap_meta);
+	} else {
+		atomic64_inc(&samon_st_nomap_other);
+		/* the unexplained class: log a few for inspection */
+		if (READ_ONCE(samon_dbg_nomap) &&
+		    atomic64_read(&samon_st_nomap_other) <= READ_ONCE(samon_dbg_nomap))
+			pr_info("nomap: dir=%s opf=0x%x sector=%llu folio_flags=%pGp refcount=%d\n",
+				dir == WRITE ? "W" : "R",
+				(unsigned int)bio->bi_opf,
+				(unsigned long long)bio->bi_iter.bi_sector,
+				&folio->flags, folio_ref_count(folio));
+	}
+}
 
-		/*
-		 * If the first real page has a mapping this is buffered I/O.
-		 * We stop at the first segment to keep the probe fast.
-		 */
-		return page_mapping(page) == NULL;
+static struct folio *samon_segment_folio(struct bio *bio, struct bio_vec *bv,
+					 int dir)
+{
+	struct folio *folio;
+
+	if (!bv->bv_page) {
+		atomic64_inc(&samon_st_skip_null);
+		return NULL;
 	}
 
-	return true; /* empty bio — skip */
+	folio = page_folio(bv->bv_page);
+
+	if (folio_test_anon(folio) || folio_test_swapcache(folio)) {
+		atomic64_inc(&samon_st_skip_anon);
+		return NULL;
+	}
+	if (!folio_mapping(folio)) {
+		samon_classify_nomap(bio, folio, dir);
+		return NULL;
+	}
+	if (folio_maybe_dma_pinned(folio)) {
+		atomic64_inc(&samon_st_skip_pinned);
+		return NULL;
+	}
+
+	return folio;
 }
 
 /* ------------------------------------------------------------------ */
 /* Core bio handler                                                    */
 /* ------------------------------------------------------------------ */
 
-static void samon_handle_bio(struct bio *bio, int dir)
+/*
+ * @budget: bytes completed by this block_rq_complete event.  The tracepoint
+ * fires before bio_advance(), once per (possibly partial) completion, and
+ * the bios still hanging off the request reflect only the not-yet-completed
+ * part.  Walking only @budget bytes avoids counting a segment again when the
+ * request completes in several steps.  Returns true once @budget is used up.
+ */
+static bool samon_handle_bio(struct bio *bio, int dir, unsigned int *budget)
 {
 	struct bio_vec bv;
 	struct bvec_iter iter;
-	sector_t lba;
+	sector_t lba = bio->bi_iter.bi_sector;
 	unsigned long flags;
 	unsigned long window_jiffies = msecs_to_jiffies(samon_window_ms);
 
-	if (samon_bio_is_direct(bio))
-		return;
-
-	lba = bio->bi_iter.bi_sector;
-
 	bio_for_each_segment(bv, bio, iter) {
-		struct page   *page = bv.bv_page;
-		struct folio  *folio;
+		struct folio *folio;
 		struct samon_lba_entry *entry;
 		bool hot;
 
-		/* Defensive: skip NULL or non-page-cache pages */
-		if (!page)
-			goto next_seg;
-		if (!page_mapping(page))
-			goto next_seg;
+		if (!*budget)
+			return true;
+		*budget -= min(*budget, bv.bv_len);
 
-		folio = page_folio(page);
+		folio = samon_segment_folio(bio, &bv, dir);
+		if (!folio)
+			goto next_seg;
 
 		spin_lock_irqsave(&samon_lba_lock, flags);
 
@@ -224,7 +323,7 @@ static void samon_handle_bio(struct bio *bio, int dir)
 		}
 
 		/* Record PFN (avoid storing raw struct page* long-term) */
-		entry->pfn = page_to_pfn(page);
+		entry->pfn = page_to_pfn(bv.bv_page);
 
 		if (dir == READ)
 			entry->read_count++;
@@ -237,18 +336,25 @@ static void samon_handle_bio(struct bio *bio, int dir)
 
 		spin_unlock_irqrestore(&samon_lba_lock, flags);
 
+		atomic64_inc(&samon_st_seg_buffered);
+
 		/*
 		 * Option B: on hot write completion, call folio_mark_accessed()
 		 * so that the next evict scan is less likely to reclaim this
-		 * page.  For reads the kernel already marks the page accessed
-		 * during I/O completion, so we only act on writes here.
+		 * page.  Reads are observation-only at this stage: whether a
+		 * read-side hint helps is to be decided by measurement.
+		 * Toggle with samon_opt_b to compare on/off.
 		 */
-		if (hot && dir == WRITE)
+		if (hot && dir == WRITE && READ_ONCE(samon_opt_b)) {
 			folio_mark_accessed(folio);
+			atomic64_inc(&samon_st_mark_accessed);
+		}
 
 next_seg:
 		lba += bv.bv_len >> SECTOR_SHIFT;
 	}
+
+	return !*budget;
 }
 
 /* ------------------------------------------------------------------ */
@@ -261,6 +367,8 @@ static void damon_sa_bio_trace(void *data, struct request *rq,
 	struct bio *bio;
 	unsigned long sector;
 	int lo, hi, mid;
+	unsigned int nr;
+	unsigned int budget;
 	int dir;
 
 	/* Skip failed completions entirely */
@@ -271,12 +379,29 @@ static void damon_sa_bio_trace(void *data, struct request *rq,
 		return;
 
 	dir = rq_data_dir(rq); /* READ or WRITE */
+	if (READ_ONCE(samon_dev_major)) {
+		struct gendisk *disk = rq->q ? rq->q->disk : NULL;
 
-	/* ---- Legacy region-counter path (binary access detection) ---- */
-	if (sa_ctx.nr_regions) {
+		if (!disk || disk->major != READ_ONCE(samon_dev_major) ||
+		    disk->first_minor != READ_ONCE(samon_dev_minor)) {
+			atomic64_inc(&samon_st_skip_dev);
+			return;
+		}
+	}
+	atomic64_inc(&samon_st_rq_seen);
+
+	/*
+	 * Legacy region-counter path (binary access detection).
+	 * nr_regions is published with WRITE_ONCE() by the updater and read
+	 * once here, clamped to the array size, so a concurrent update can at
+	 * worst yield a stale region lookup but never an out-of-bounds index.
+	 */
+	nr = min_t(unsigned int, READ_ONCE(sa_ctx.nr_regions),
+		   DAMON_SA_MAX_REGIONS);
+	if (nr) {
 		sector = blk_rq_pos(rq);
 		lo = 0;
-		hi = sa_ctx.nr_regions - 1;
+		hi = nr - 1;
 		while (lo <= hi) {
 			mid = (lo + hi) / 2;
 			if (sector < sa_ctx.region_starts[mid])
@@ -291,8 +416,13 @@ static void damon_sa_bio_trace(void *data, struct request *rq,
 	}
 
 	/* ---- New path: LBA->page mapping + frequency tracking ---- */
-	__rq_for_each_bio(bio, rq)
-		samon_handle_bio(bio, dir);
+	if (nr_bytes < blk_rq_bytes(rq))
+		atomic64_inc(&samon_st_budget_cut);
+	budget = nr_bytes;
+	__rq_for_each_bio(bio, rq) {
+		if (samon_handle_bio(bio, dir, &budget))
+			break;
+	}
 }
 
 /* ------------------------------------------------------------------ */
@@ -315,7 +445,7 @@ static void damon_sa_update_region_map(struct damon_ctx *ctx)
 			idx++;
 		}
 	}
-	sa_ctx.nr_regions = idx;
+	WRITE_ONCE(sa_ctx.nr_regions, idx);
 	mutex_unlock(&sa_ctx_lock);
 }
 
@@ -326,11 +456,17 @@ static void damon_sa_init(struct damon_ctx *ctx)
 	mutex_lock(&sa_ctx_lock);
 	for (i = 0; i < DAMON_SA_MAX_REGIONS; i++)
 		atomic_set(&sa_ctx.io_counts[i], 0);
-	sa_ctx.nr_regions = 0;
+	WRITE_ONCE(sa_ctx.nr_regions, 0);
 	sa_ctx.active     = true;
-	mutex_unlock(&sa_ctx_lock);
 
-	register_trace_block_rq_complete(damon_sa_bio_trace, NULL);
+	/* kdamond may be restarted: never register the probe twice */
+	if (!samon_probe_registered) {
+		if (register_trace_block_rq_complete(damon_sa_bio_trace, NULL))
+			pr_err("failed to register block_rq_complete probe\n");
+		else
+			samon_probe_registered = true;
+	}
+	mutex_unlock(&sa_ctx_lock);
 }
 
 static void damon_sa_prepare_access_checks(struct damon_ctx *ctx)
@@ -370,12 +506,14 @@ static unsigned int damon_sa_check_accesses(struct damon_ctx *ctx)
 
 static void damon_sa_cleanup(struct damon_ctx *ctx)
 {
-	unregister_trace_block_rq_complete(damon_sa_bio_trace, NULL);
-	tracepoint_synchronize_unregister();
-
 	mutex_lock(&sa_ctx_lock);
+	if (samon_probe_registered) {
+		unregister_trace_block_rq_complete(damon_sa_bio_trace, NULL);
+		samon_probe_registered = false;
+	}
 	sa_ctx.active = false;
 	mutex_unlock(&sa_ctx_lock);
+	tracepoint_synchronize_unregister();
 
 	samon_lba_tree_free();
 }
@@ -430,6 +568,65 @@ static const struct file_operations samon_dbgfs_fops = {
 	.release = single_release,
 };
 
+/* debugfs: /sys/kernel/debug/samon/stats */
+static int samon_stats_show(struct seq_file *m, void *v)
+{
+	unsigned long flags;
+	unsigned int nr;
+
+	spin_lock_irqsave(&samon_lba_lock, flags);
+	nr = samon_nr_entries;
+	spin_unlock_irqrestore(&samon_lba_lock, flags);
+
+	seq_printf(m, "rq_seen=%lld\n",
+		   (long long)atomic64_read(&samon_st_rq_seen));
+	seq_printf(m, "seg_buffered=%lld\n",
+		   (long long)atomic64_read(&samon_st_seg_buffered));
+	seq_printf(m, "skip_null=%lld\n",
+		   (long long)atomic64_read(&samon_st_skip_null));
+	seq_printf(m, "skip_anon=%lld\n",
+		   (long long)atomic64_read(&samon_st_skip_anon));
+	seq_printf(m, "skip_nomap=%lld\n",
+		   (long long)atomic64_read(&samon_st_skip_nomap));
+	seq_printf(m, "skip_pinned=%lld\n",
+		   (long long)atomic64_read(&samon_st_skip_pinned));
+	seq_printf(m, "drop_full=%lld\n",
+		   (long long)atomic64_read(&samon_st_drop_full));
+	seq_printf(m, "drop_nomem=%lld\n",
+		   (long long)atomic64_read(&samon_st_drop_nomem));
+	seq_printf(m, "nomap_slab=%lld\n",
+		   (long long)atomic64_read(&samon_st_nomap_slab));
+	seq_printf(m, "nomap_flagged=%lld\n",
+		   (long long)atomic64_read(&samon_st_nomap_flagged));
+	seq_printf(m, "nomap_meta=%lld\n",
+		   (long long)atomic64_read(&samon_st_nomap_meta));
+	seq_printf(m, "nomap_other=%lld\n",
+		   (long long)atomic64_read(&samon_st_nomap_other));
+	seq_printf(m, "nomap_write=%lld\n",
+		   (long long)atomic64_read(&samon_st_nomap_write));
+	seq_printf(m, "skip_dev=%lld\n",
+		   (long long)atomic64_read(&samon_st_skip_dev));
+	seq_printf(m, "budget_cut=%lld\n",
+		   (long long)atomic64_read(&samon_st_budget_cut));
+	seq_printf(m, "mark_accessed=%lld\n",
+		   (long long)atomic64_read(&samon_st_mark_accessed));
+	seq_printf(m, "entries=%u max_entries=%u\n", nr, samon_max_entries);
+	return 0;
+}
+
+static int samon_stats_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, samon_stats_show, NULL);
+}
+
+static const struct file_operations samon_stats_fops = {
+	.owner   = THIS_MODULE,
+	.open    = samon_stats_open,
+	.read    = seq_read,
+	.llseek  = seq_lseek,
+	.release = single_release,
+};
+
 /* ------------------------------------------------------------------ */
 /* Module init / exit                                                  */
 /* ------------------------------------------------------------------ */
@@ -460,6 +657,9 @@ static int __init damon_sa_initcall(void)
 		debugfs_create_file("lba_page_map", 0444,
 				    samon_dbgfs_dir, NULL,
 				    &samon_dbgfs_fops);
+	if (!IS_ERR_OR_NULL(samon_dbgfs_dir))
+		debugfs_create_file("stats", 0444, samon_dbgfs_dir, NULL,
+				    &samon_stats_fops);
 
 	pr_info("SAMON saddr ops registered (hot_threshold=%u window_ms=%u)\n",
 		samon_hot_threshold, samon_window_ms);
