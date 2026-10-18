@@ -1,6 +1,6 @@
 # SAMON 커널 operations set (saddr)
 
-Linux 커널 6.8의 DAMON operations set으로 구현한 스토리지(블록 디바이스) 주소 공간 관측 코드이다. block layer에서 완료된 I/O를 LBA 단위로 관측하고, read/write 빈도수로 자주 발생하는 I/O를 판정하며, 해당 LBA를 실제 page(PFN)와 정방향으로 연결한다. 현재 Verify_Script로 확인한 page 조작은 hot write(P5)에 `folio_mark_accessed()`를 호출하는 힌트 한 가지뿐이며 그 효과는 측정하지 않았다. S1부터 이 호출은 block 완료 콜백에서 직접 하지 않고, 콜백이 요청만 큐(Deferred_Queue)에 넣으면 kdamond가 프로세스 컨텍스트에서 실행한다. S2는 segment마다 패턴 P1~P6 중 하나를 판정하고, P1~P4에는 `folio_activate()`(promote) 또는 `folio_deactivate()`(demote) 요청을 같은 큐로 보내는 코드를 더했다. 이 지연 경로와 패턴 감지는 구현되어 있으나 아직 Verify_Script로 검증하지 않았다(구현됨, 미검증). 패턴별 조작 토글 samon_act_p1~p4의 기본값은 0(끔)이다.
+Linux 커널 6.8의 DAMON operations set으로 구현한 스토리지(블록 디바이스) 주소 공간 관측 코드이다. block layer에서 완료된 I/O를 LBA 단위로 관측하고, read/write 빈도수로 자주 발생하는 I/O를 판정하며, 해당 LBA를 실제 page(PFN)와 정방향으로 연결한다. Verify_Script가 확인하는 page 조작은 hot write(P5)의 `folio_mark_accessed()` 호출 건수와 패턴별 요청·실행 건수까지이며, page의 LRU 상태가 실제로 바뀌었는지와 그 효과는 확인하거나 측정하지 않았다. S1부터 이 호출은 block 완료 콜백에서 직접 하지 않고, 콜백이 요청만 큐(Deferred_Queue)에 넣으면 kdamond가 프로세스 컨텍스트에서 실행한다. S2는 segment마다 패턴 P1~P6 중 하나를 판정하고, P1~P4에는 `folio_activate()`(promote) 또는 `folio_deactivate()`(demote) 요청을 같은 큐로 보내는 코드를 더했다. 이 지연 경로와 패턴 감지는 #11 빌드에서 Verify_Script 37개 항목(진입 계측 등식, 큐 회계 등식, 패턴 P1~P4 판정, 토글별 요청·실행 건수)이 PASS했다. 실행 컨텍스트 안전성, page 상태 변화, 효과는 검증하지 않았다. 패턴별 조작 토글 samon_act_p1~p4의 기본값은 0(끔)이다.
 
 eBPF 기반 유저스페이스 스크립트(samon_probe.py, samon_monitor.py 등)는 이 구현의 기반이 아니다. 이 디렉터리의 코드는 모두 커널 내부(mm/damon/saddr.c)에서 동작한다.
 
@@ -10,17 +10,17 @@ eBPF 기반 유저스페이스 스크립트(samon_probe.py, samon_monitor.py 등
 
 | 구분 | 상태 |
 |---|---|
-| 관측 (block_rq_complete, buffered I/O 한정, 디스크 필터) | 구현, 기존 Verify 항목 PASS (#11, 19/19) |
-| LBA to page 정방향 연동 (4KB 단위 rbtree, PFN 기록) | 구현, 기존 Verify 항목 PASS (#11, 19/19) |
-| 빈도 판정 (read/write 분리 카운터, 시간 창, 단일 임계값) | 구현, 기존 Verify 항목 PASS (#11, 19/19) |
-| 진입 계측 (skip_error, skip_passthru, ctx_hardirq/softirq/task) | 구현됨, 미검증 (Verify 항목 없음) |
-| 지연 조작 구조 (Deferred_Queue, SAMON_Actuator, 큐 회계 카운터 req/exec/drop) | 구현됨, 미검증 (Verify 항목 없음) |
-| page 조작 (hot write에 folio_mark_accessed, P5 요청을 큐에 넣고 kdamond가 실행) | 구현됨, 미검증. 옵션 B 토글(samon_opt_b)은 기존 Verify 항목이 #11에서 PASS했으나 지연 경로의 실행 컨텍스트와 효과는 미검증 |
-| 패턴 감지 P1~P6 (S2: Stream_Table, Loop_History, Reread_Table, 패턴 분류 우선순위) | 구현됨, 미검증 (Verify 항목 없음) |
-| 패턴별 조작 (S2: samon_act_p1~p4 토글, P1/P4 demote, P2 promote, P3 promote/demote 분할) | 구현됨, 미검증 (토글 기본값 0, 동작 시험과 효과 측정 없음) |
-| 관측용 debugfs 확장 (S2: streams, wb_hist, stream_* stats 줄) | 구현됨, 미검증 |
+| 관측 (block_rq_complete, buffered I/O 한정, 디스크 필터) | 구현, 기존 Verify 항목 PASS (#11, 37/37 중 기존 19개) |
+| LBA to page 정방향 연동 (4KB 단위 rbtree, PFN 기록) | 구현, 기존 Verify 항목 PASS (#11, 37/37 중 기존 19개) |
+| 빈도 판정 (read/write 분리 카운터, 시간 창, 단일 임계값) | 구현, 기존 Verify 항목 PASS (#11, 37/37 중 기존 19개) |
+| 진입 계측 (skip_error, skip_passthru, ctx_hardirq/softirq/task) | ctx 합 = rq_seen, skip_passthru 증가: PASS (#11, 신규 Verify 항목). skip_error: 미검증 (에러 주입 없음) |
+| 지연 조작 구조 (Deferred_Queue, SAMON_Actuator, 큐 회계 카운터 req/exec/drop) | 큐 회계 등식, direct_ops = 0, kdamond off 뒤 q_cur = 0: PASS (#11). 큐 가득 참과 각 drop 경로의 정확성, 실행 컨텍스트 안전성: 미검증 |
+| page 조작 (hot write에 folio_mark_accessed, P5 요청을 큐에 넣고 kdamond가 실행) | 옵션 B 토글의 호출 건수(mark_accessed off +0, on +6)와 P5 큐 회계: PASS (#11). 호출 뒤 page 상태 변화, 지연 경로의 실행 컨텍스트, 효과: 미검증 |
+| 패턴 감지 P1~P6 (S2: Stream_Table, Loop_History, Reread_Table, 패턴 분류 우선순위) | P1(단독, 구간 내 랜덤, 랜덤 간섭), P2, P3, P4 판정과 랜덤 read가 P1로 분류되지 않음: PASS (#11, 신규 Verify 항목). P5 판정 전용 항목, samon_dbg_lba = 0 동작, 표 칸 교체와 idle 정리 세부: 미검증 |
+| 패턴별 조작 (S2: samon_act_p1~p4 토글, P1/P4 demote, P2 promote, P3 promote/demote 분할) | 토글을 켠 P1~P4의 실행 건수 ≥ 1, 토글 0이면 요청·실행 0: PASS (#11). promote/demote가 page의 LRU 상태를 실제로 바꾸는지와 효과: 미검증 |
+| 관측용 debugfs 확장 (S2: streams, wb_hist, stream_* stats 줄) | 구현됨(미검증). Verify 출력에 stream_* 줄이 나오는 것은 보였으나 판정 항목이 아니고 streams, wb_hist는 확인하지 않았다 |
 | 영역(region) 단위 집계, 엔트리 aging | 미구현 |
-| 정책 판단(promote/유지/demote를 자동으로 고르는 정책, 폴백), 효과 있는 read 쪽 조작 | 미구현 (토글로 켜는 고정 규칙 조작만 코드에 있고 미검증) |
+| 정책 판단(promote/유지/demote를 자동으로 고르는 정책, 폴백), 효과 있는 read 쪽 조작 | 미구현 (토글로 켜는 고정 규칙 조작만 코드에 있다. 요청·실행 건수만 PASS이고 효과는 미검증) |
 | 점수 체계, DAMOS 연동 | 미구현 (범위 밖) |
 | 효과 측정 | 하네스 스크립트만 있고 실행하지 않음 |
 
@@ -70,7 +70,7 @@ cat /sys/kernel/debug/samon/stats
 | samon_max_entries | 65536 | LBA 트리에 보관하는 엔트리 상한 (메모리 상한) |
 | samon_dbg_nomap | 0 | nomap_other 부류의 segment를 누적 개수가 이 값 이하인 동안 dmesg에 기록, 0이면 끔 |
 
-S2가 추가한 파라미터 (모두 구현됨, 미검증이며 기본값은 saddr.c의 SAMON_DEF_* 상수와 선언에서 가져왔다). "즉시"는 읽을 때마다 반영, "다음 시작"은 kdamond를 다시 켤 때 반영한다.
+S2가 추가한 파라미터 (모두 구현됨. Verify가 시작할 때 기본값을 쓰고 읽어 되돌려 확인하며 #11에서 PASS했다. 각 파라미터가 동작에 미치는 영향은 일부만 간접 확인했고 나머지는 미검증이다. 기본값은 saddr.c의 SAMON_DEF_* 상수와 선언에서 가져왔다). "즉시"는 읽을 때마다 반영, "다음 시작"은 kdamond를 다시 켤 때 반영한다.
 | 파라미터 | 기본값 | 허용 범위 | 반영 시점 | 의미 |
 |---|---|---|---|---|
 | samon_act_p1, p2, p3, p4 | 0, 0, 0, 0 | 0 또는 1 | 즉시 | 패턴별 조작 토글. 0이면 감지와 집계만 하고 요청을 큐에 넣지 않으며, 큐에서 꺼낼 때도 다시 확인한다. P5는 samon_opt_b를 따른다 |
@@ -91,7 +91,7 @@ S2가 추가한 파라미터 (모두 구현됨, 미검증이며 기본값은 sad
 
 ### 1. 관측 훅지점
 - block_rq_complete tracepoint에 register_trace_block_rq_complete()로 콜백을 등록한다.
-- 콜백 진입 때 완료 하나를 아래 네 부류 중 정확히 하나로 센다 (kdamond 등록 구간 안에서만). (1) 완료 에러(error != 0)는 skip_error, (2) passthrough request(blk_rq_is_passthrough)는 skip_passthru, (3) 대상 디스크 필터에 맞지 않으면 skip_dev, (4) 나머지는 rq_seen이며 이 경우 실행 컨텍스트에 따라 ctx_hardirq, ctx_softirq, ctx_task 중 하나를 센다. 따라서 ctx_hardirq + ctx_softirq + ctx_task = rq_seen이어야 한다 (이 등식은 아직 Verify 항목이 아니다).
+- 콜백 진입 때 완료 하나를 아래 네 부류 중 정확히 하나로 센다 (kdamond 등록 구간 안에서만). (1) 완료 에러(error != 0)는 skip_error, (2) passthrough request(blk_rq_is_passthrough)는 skip_passthru, (3) 대상 디스크 필터에 맞지 않으면 skip_dev, (4) 나머지는 rq_seen이며 이 경우 실행 컨텍스트에 따라 ctx_hardirq, ctx_softirq, ctx_task 중 하나를 센다. 따라서 ctx_hardirq + ctx_softirq + ctx_task = rq_seen이어야 한다 (이 등식은 Verify 항목이며 #11에서 PASS했다).
 - rq_data_dir()로 READ/WRITE를 구분한다.
 - 부분 완료 처리: 이 tracepoint는 blk_update_request() 맨 앞에서 bio_advance()/bio_endio() 이전에 발화하며, request가 여러 번에 나뉘어 완료되면 그때마다 발화한다. 콜백은 nr_bytes만큼의 segment만 순회해서 같은 segment를 중복 집계하지 않는다. nr_bytes가 request 전체보다 작았던 횟수는 stats의 budget_cut에 기록한다.
 - 대상 디스크 필터(samon_dev_major/minor)에 맞지 않는 request는 skip_dev로 세고 건너뛴다.
@@ -104,15 +104,17 @@ S2가 추가한 파라미터 (모두 구현됨, 미검증이며 기본값은 sad
 
 | 구간 | rq_seen | ctx_hardirq | ctx_softirq | ctx_task | skip_error | skip_passthru | skip_dev |
 |---|---|---|---|---|---|---|---|
-| Verify 실행 전체 누적 (#11) | 2301 | 0 | 2301 | 0 | 0 | 14 | 10 |
+| Verify 실행 전체 누적 (#11, 기존 19개 항목 시점) | 2301 | 0 | 2301 | 0 | 0 | 14 | 10 |
+| Verify 37개 항목 실행 누적 (#11, 2026-10-18, 출력 /var/tmp/samon_verify_run.txt) | 546030 | 0 | 546030 | 0 | 1 | 4180 | 30 |
 | buffered write 차분 | 미실행 | 미실행 | 미실행 | 미실행 | 미실행 | 미실행 | 미실행 |
 | buffered read 차분 | 미실행 | 미실행 | 미실행 | 미실행 | 미실행 | 미실행 | 미실행 |
 | fsync 차분 | 미실행 | 미실행 | 미실행 | 미실행 | 미실행 | 미실행 | 미실행 |
 
 - 워크로드별 차분 세 행은 값이 이 저장소와 작업 기록에 없어 채우지 않았다 (미실행 또는 미보고). 측정 명령은 워크로드마다 `/sys/kernel/debug/samon/stats` 전후 스냅샷을 찍고 위 일곱 항목의 차분을 구하면 된다. 예: buffered write는 `dd if=/dev/zero of=<DIR>/w bs=1M count=64 conv=fsync`, buffered read는 캐시를 비운 뒤 `dd if=<DIR>/w of=/dev/null bs=1M`, fsync는 4KB write 후 `fsync`를 50회 반복한다 (명령은 예시이며 아직 실행하지 않았다).
-- 누적 행에서 ctx 합(2301) = rq_seen(2301)이다. 이는 한 번의 관찰이며 Verify 항목이 아니므로 등식의 PASS 근거로 쓰지 않는다 (미검증).
-- 누적 행에서 ctx_hardirq = 0, ctx_task = 0이고 전부 softirq였다. 이 VM(VMware, SCSI)의 한 번 실행 결과이며 다른 디스크 드라이버에서의 분포는 확인하지 않았다.
-- skip_passthru 14의 출처 디바이스는 확인하지 않았다. 이전에 nomap_other로 섞여 세던 sr 폴링(REQ_OP_DRV_IN)이 여기로 분리된다는 것이 예상이지만, 같은 실행의 nomap_other = 0이라는 사실만 확인했고 14건이 sr0/sr1 것이라는 직접 증거는 없다. 10초 무 I/O 구간의 skip_passthru ≥ 1은 S3 Verify 항목(미작성)으로 남아 있다.
+- 기존 19개 항목 시점의 누적 행에서 ctx 합(2301) = rq_seen(2301)이었다. 이는 당시 Verify 항목이 없던 한 번의 관찰이다. 지금은 Verify 신규 항목이 sync 뒤 1초 대기하고 읽어 비교한다(불일치하면 1초 간격으로 최대 3회 다시 읽음). #11 실행에서 첫 읽기에 hardirq 0 + softirq 235920 + task 0 = 235920 = rq_seen이어서 PASS했다.
+- 두 누적 행 모두 ctx_hardirq = 0, ctx_task = 0이고 전부 softirq였다. 이 VM(VMware, SCSI)의 실행 결과이며 다른 디스크 드라이버에서의 분포는 확인하지 않았다.
+- 첫 누적 행의 skip_passthru 14의 출처 디바이스는 확인하지 않았다. 이전에 nomap_other로 섞여 세던 sr 폴링(REQ_OP_DRV_IN)이 여기로 분리된다는 것이 예상이지만, 같은 실행의 nomap_other = 0이라는 사실만 확인했고 14건이 sr0/sr1 것이라는 직접 증거는 없다. Verify 신규 항목이 스크립트가 I/O를 내지 않는 10초 동안 skip_passthru가 +10 늘어난 것을 확인해 PASS했다(sr0, sr1이 있는 VM). 어느 디바이스의 요청인지는 여전히 확인하지 않았다.
+- 37개 항목 실행 누적 행의 skip_error = 1은 에러 주입 없이 관찰된 값이다. 어떤 완료였는지는 확인하지 않았다 (미검증). stats는 부팅 이후 누적이므로 두 누적 행을 차분으로 비교하지 않는다.
 
 ### 2. bio에서 page 추출
 - request에 연결된 bio를 __rq_for_each_bio()로 순회하고, bio_for_each_segment()로 bi_io_vec의 각 segment에 접근한다.
@@ -144,7 +146,7 @@ nomap의 정체에 대한 확인 결과:
 - 한계: 로그에 디바이스 이름이 없어 두 CD-ROM에서 나온다는 것을 직접 확인한 것은 아니고 정황(op 코드, 호출 위치, 주기와 개수)의 일치에 근거한다. 이 부류는 page cache I/O가 아니므로 관측 대상에서 제외되는 것이 맞다.
 - 필터(samon_dev_major=8)를 켠 뒤 nomap_other가 +8 늘어난 것을 한때 sda에서도 nomap이 나오는 증거로 해석했으나, 폴링 주기(약 1건/초)와 필터를 켜기까지의 시간으로 설명되므로 그 해석은 철회했다.
 - 이전 실행에서 보였던 수만 건의 nomap은 이 폴링만으로 설명되지 않는다(1초에 약 1건 수준). 그 값이 어디서 나왔는지는 확인하지 못했다.
-- passthrough request(blk_rq_is_passthrough)는 S1에서 콜백 진입 단계에서 별도 카운터 skip_passthru로 분리했다(구현됨, 미검증). 이 빌드에서는 passthrough request가 segment 검사까지 오지 않으므로 nomap_other에 섞이지 않는다. 위 nomap_other 관찰은 분리 이전 빌드(#10)의 결과이다.
+- passthrough request(blk_rq_is_passthrough)는 S1에서 콜백 진입 단계에서 별도 카운터 skip_passthru로 분리했다(무 I/O 10초 구간의 증가는 Verify PASS). 이 빌드에서는 passthrough request가 segment 검사까지 오지 않으므로 nomap_other에 섞이지 않는다. 위 nomap_other 관찰은 분리 이전 빌드(#10)의 결과이다.
 
 ### 4. LBA to page 연동 자료구조
 - LBA를 키로 하는 rbtree. 엔트리는 lba, pfn, read_count, write_count, last_jiffies를 가진다. 엔트리는 4KB segment 단위이며 영역(region) 단위 집계는 하지 않는다.
@@ -155,31 +157,31 @@ nomap의 정체에 대한 확인 결과:
 ### 5. 빈도수 기반 판정
 - read/write 카운터를 분리해서 센다.
 - 윈도우(samon_window_ms)가 지나면 카운터를 0으로 리셋한다.
-- 방향별 카운터가 samon_hot_threshold 이상이면 hot으로 판정한다 (이진 판정). 순차/반복 같은 패턴 분류는 S2에서 별도 구조로 추가했고(9절, 구현됨, 미검증), 점수 등급 체계는 구현하지 않았다.
+- 방향별 카운터가 samon_hot_threshold 이상이면 hot으로 판정한다 (이진 판정). 순차/반복 같은 패턴 분류는 S2에서 별도 구조로 추가했고(9절, P1~P4 판정은 Verify PASS), 점수 등급 체계는 구현하지 않았다.
 
 ### 6. 옵션 B (미래 접근 예측 반영)
 - hot으로 판정된 write completion에서 folio_mark_accessed()를 호출한다. 기존 커널 API만 사용하며 커널 소스는 수정하지 않는다.
 - read는 관측만 한다. read 시점 힌트의 효과는 측정으로 판단할 사안으로 남겨 둔다. read 완료 시점의 page는 LRU에 올라가 있지만 사용자 접근 전이다.
 - samon_opt_b 파라미터로 호출을 끌 수 있어, 켠 경우와 끈 경우를 같은 워크로드로 비교할 수 있다. 호출 횟수는 stats의 mark_accessed에 기록한다.
-- S1 변경 (구현됨, 미검증): 콜백은 더 이상 folio_mark_accessed()를 직접 호출하지 않는다. hot write(P5)로 판정하면 folio_get()으로 참조를 잡고 CPU별 Deferred_Queue에 요청을 넣는다. kdamond가 한 샘플링 주기의 맨 앞(damon_sa_prepare_access_checks)에서 큐를 비우며(SAMON_Actuator), 항목마다 토글, stale(samon_q_max_ms), 재검증(LRU 상태, dirty/writeback 등) 순으로 확인한 뒤 실행하고 참조를 놓는다. page를 조작하는 지점은 이 경로 하나뿐이고, 프로세스가 아닌 컨텍스트에서 호출되면 실행하지 않고 direct_ops만 올린다. 큐가 가득 차면 항목을 버리고 drop_queue_p5로 센다.
+- S1 변경 (구현됨. 큐 회계 등식과 direct_ops = 0은 #11 Verify PASS, 실행 컨텍스트 안전성과 효과는 미검증): 콜백은 더 이상 folio_mark_accessed()를 직접 호출하지 않는다. hot write(P5)로 판정하면 folio_get()으로 참조를 잡고 CPU별 Deferred_Queue에 요청을 넣는다. kdamond가 한 샘플링 주기의 맨 앞(damon_sa_prepare_access_checks)에서 큐를 비우며(SAMON_Actuator), 항목마다 토글, stale(samon_q_max_ms), 재검증(LRU 상태, dirty/writeback 등) 순으로 확인한 뒤 실행하고 참조를 놓는다. page를 조작하는 지점은 이 경로 하나뿐이고, 프로세스가 아닌 컨텍스트에서 호출되면 실행하지 않고 direct_ops만 올린다. 큐가 가득 차면 항목을 버리고 drop_queue_p5로 센다.
 - 아래는 S1 이전 구조(콜백 직접 호출)에 대한 안전성 우려이다. 지연 경로로 바꾼 뒤에도 이 우려가 해소됐다는 검증은 하지 않았다 (미검증).
 - 호출 컨텍스트 안전성 (미검증): folio_mark_accessed()는 내부에서 folio_activate()를 호출하고, 이 함수는 mm/swap.c에서 local_lock(&cpu_fbatches.lock)(인터럽트를 막지 않는 형태)을 쓴다. 이 훅은 softirq/인터럽트 컨텍스트에서 실행될 수 있으므로, 프로세스가 같은 per-CPU 배치를 갱신하는 도중에 끼어들면 배치가 손상될 가능성이 있다. 지금까지 경고나 이상은 관찰되지 않았지만 lockdep 등 엄격한 검사 빌드로 확인한 적이 없어, 안전하다고 확인된 것이 아니다. 해결 방향은 콜백에서는 기록만 하고 조작은 프로세스 컨텍스트로 지연 실행하는 것이다.
 
 ### 7. 안정성 처리
 - kdamond를 재시작해도 tracepoint가 중복 등록되지 않도록 등록 상태 플래그를 둔다.
-- cleanup은 unregister 후 tracepoint_synchronize_unregister()를 호출한 뒤 큐에 남은 항목을 drop_shutdown_pN으로 세며 folio 참조를 놓고(shutdown), 그 다음 트리와 큐를 해제한다. 큐 메모리 할당에 실패하면 probe를 등록하지 않는다 (구현됨, 미검증).
-- 큐 회계: 패턴 N마다 req_pN = exec_pN + drop_*_pN 합 + 아직 끝나지 않은 항목(q_cur)이어야 한다. 이 등식을 Verify_Script로 확인하는 항목은 아직 없다 (미검증).
+- cleanup은 unregister 후 tracepoint_synchronize_unregister()를 호출한 뒤 큐에 남은 항목을 drop_shutdown_pN으로 세며 folio 참조를 놓고(shutdown), 그 다음 트리와 큐를 해제한다. 큐 메모리 할당에 실패하면 probe를 등록하지 않는다 (구현됨. kdamond off 뒤 q_cur = 0과 회계 등식은 Verify PASS, 할당 실패 경로는 미검증).
+- 큐 회계: 패턴 N마다 req_pN = exec_pN + drop_*_pN 합 + 아직 끝나지 않은 항목(q_cur)이어야 한다. Verify_Script가 이 등식을 wait_q0 뒤(kdamond 켜진 상태)와 kdamond를 끈 뒤에 N=1..5에 대해 확인하며 #11에서 PASS했다. wait_q0 뒤에는 q_cur = 0이므로 판정식에서 q_cur 항이 빠진다.
 - 기존 region 카운터 경로의 nr_regions는 READ_ONCE/WRITE_ONCE로 읽고 쓰며, 읽을 때 배열 크기로 clamp하여 동시 갱신 중에도 범위 밖 접근이 생기지 않게 한다.
 
 ### 8. 관측용 debugfs
 - /sys/kernel/debug/samon/lba_page_map: 엔트리별 lba, pfn, reads, writes, hot_r, hot_w
 - /sys/kernel/debug/samon/stats: `이름=값` 한 줄씩. rq_seen, seg_buffered, skip_null, skip_anon, skip_nomap(nomap_slab, nomap_flagged, nomap_meta, nomap_other, nomap_write), skip_pinned, skip_dev, budget_cut, mark_accessed(req_p5의 별칭), 진입 계측(skip_error, skip_passthru, ctx_hardirq, ctx_softirq, ctx_task), 패턴 감지 det_pN, 큐 회계(req_pN, exec_pN, drop_<queue|stale|revalidate|toggle|shutdown>_pN, q_cur, q_max_delay_us, q_cap, direct_ops), 마지막 줄 `entries=<n> max_entries=<n>`. 값은 부팅 이후 누적이며 kdamond를 다시 시작해도 0으로 돌아가지 않는다.
-- seg_buffered의 정의가 바뀌었다. 이전에는 SAMON_Map(LBA 트리)에 항목이 생긴 segment만 셌다. 지금은 SAMON_Filter(error, passthrough, 대상 디스크, 그리고 segment 단위의 null/anon/no-mapping/pinned 검사)를 통과한 모든 segment를 센다. 트리가 가득 차서 새 항목을 못 만든 segment(drop_full)와 메모리 부족으로 못 만든 segment(drop_nomem)도 포함한다. 그래서 값이 이전 빌드보다 클 수 있고, 빌드 간 직접 비교는 하지 않는다. #11 Verify 출력에서 seg_buffered(22823)는 det_p1..det_p6의 합(2885 + 0 + 0 + 1346 + 18 + 18574 = 22823)과 같았다. 이는 한 번의 관찰이며 Verify 항목이 아니다 (미검증).
+- seg_buffered의 정의가 바뀌었다. 이전에는 SAMON_Map(LBA 트리)에 항목이 생긴 segment만 셌다. 지금은 SAMON_Filter(error, passthrough, 대상 디스크, 그리고 segment 단위의 null/anon/no-mapping/pinned 검사)를 통과한 모든 segment를 센다. 트리가 가득 차서 새 항목을 못 만든 segment(drop_full)와 메모리 부족으로 못 만든 segment(drop_nomem)도 포함한다. 그래서 값이 이전 빌드보다 클 수 있고, 빌드 간 직접 비교는 하지 않는다. #11 Verify 출력에서 seg_buffered(22823)는 det_p1..det_p6의 합(2885 + 0 + 0 + 1346 + 18 + 18574 = 22823)과 같았다. 이는 한 번의 관찰이며 Verify 항목이 아니다 (미검증). 37개 항목 실행의 패턴 시험 구간에서도 구간 차분의 det_p1..det_p6 합(info 줄의 det_sum)이 seg_buffered 차분과 같았으나 판정 항목은 아니다.
 - S2가 추가한 stats 줄과 debugfs 파일(streams, wb_hist)은 9절에 적었다.
 
-### 9. 패턴 감지 (S2, 구현됨, 미검증)
+### 9. 패턴 감지 (S2, P1~P4 판정은 Verify PASS)
 
-이 절의 모든 기능은 saddr.c에 구현되어 #11 빌드에 들어 있으나, #11에서 통과한 Verify 19개 항목은 이 기능을 확인하지 않는다. 따라서 이 절의 어떤 항목도 PASS가 아니다.
+이 절의 기능은 saddr.c에 구현되어 #11 빌드에 들어 있다. #11에서 Verify의 신규 18개 항목이 P1~P4 판정과 토글별 요청·실행 건수를 확인해 PASS했다(수치는 "항목별 상태" 표). 아래 설명 중 Verify로 확인하지 않은 부분(P5 판정 전용, samon_dbg_lba = 0 동작, 표 칸 교체와 idle 정리 세부, debugfs 출력 형식)은 미검증이다.
 
 #### 패턴 판정
 
@@ -227,17 +229,18 @@ segment마다 정확히 하나의 패턴을 판정하고 det_pN을 센다(토글
 
 #### 검증 상태 (S2)
 
-Verify 항목이 없어서 위 모든 기능이 구현됨, 미검증이다. #11의 Verify 19/19 PASS는 이 기능과 무관하다. 참고 관찰 하나: #11 Verify 실행 출력의 마지막 stats에서 det_p1..det_p6는 2885, 0, 0, 1346, 18, 18574였다(8절의 seg_buffered 합과 일치). 이 값이 의도한 패턴 판정의 결과인지는 확인하지 않았다.
+#11 Verify 37/37 PASS(2026-10-18)에 포함된 확인: P1(단독), 구간 내 랜덤, P1 + 랜덤 간섭, P2, P3, P4, 랜덤 대조, 토글 0 재실행 P1~P4. 확인한 것은 패턴별 감지 건수(det_pN)와 요청·실행 건수이며, 의도한 패턴 외의 det가 얼마나 섞이는지(예: P1 시험의 det_p6 +4224)는 판정하지 않고 info 줄로만 남긴다. 미검증: P5 판정 전용 항목, samon_dbg_lba = 0에서 P5 비감지, Stream_Table 칸 교체와 Loop_History idle 정리의 세부, debugfs streams와 wb_hist 출력 형식.
 
 ## 검증 상태
 
-PASS는 실제 커널에서 Verify_Script로 실행한 결과가 있는 항목만 해당한다. 아래 표의 PASS 행은 #11(현재 설치된 빌드)의 19/19 PASS에도 포함된다. 환경은 VMware VM, ext4(/dev/sda2, 파티션 시작 섹터 4096, 블록 4096바이트), 메모리 8GB이며 커널 6.8.0-SAMON이다.
+PASS는 실제 커널에서 Verify_Script로 실행한 결과가 있는 항목만 해당한다. 아래 표의 PASS 행은 read/write 카운터 분리 행(#11 전용 항목 없음)을 빼고 모두 #11(현재 설치된 빌드)의 Verify 37/37 PASS에 포함된다. 환경은 VMware VM, ext4(/dev/sda2, 파티션 시작 섹터 4096, 블록 4096바이트), 메모리 8GB이며 커널 6.8.0-SAMON이다.
 
 ### 항목별 상태
 
 | 항목 | 상태 | 근거 (커널 빌드, 방식, 결과) |
 |---|---|---|
 | tracepoint 등록, stats/debugfs 노출 | PASS | #8 이후 매 실행; #11 Verify 재확인 PASS |
+| 기본 파라미터 쓰기·읽기 확인 | PASS | #11 Verify 시작 단계. 모든 samon_* 파라미터 기본값을 쓰고 읽어 되돌려 확인한 뒤 kdamond를 off → on (opt_b는 Y/N로 읽히므로 1/0으로 환산) |
 | LBA와 파일 물리 위치 일치 | PASS | 4MB buffered write 후 filefrag -e의 physical 블록을 섹터로 변환(블록 크기 / 512배 + 파티션 시작 섹터)해 lba_page_map과 비교, 1024개 중 1024개 일치 (#8, #9, #10 모두 동일); #11 Verify 재확인 PASS |
 | direct I/O 배제 (anon 경로) | PASS | fio --direct=1 4MB write, 해당 파일 섹터와 맵의 교집합 0개, skip_anon +1024; #11 Verify 재확인 PASS |
 | direct I/O 배제 (pin 경로) | PASS | test_pinned(mmap 소스 O_DIRECT 1MiB), skip_pinned +256, 대상 섹터 0개 (#9); #11 Verify 재확인 PASS |
@@ -250,15 +253,23 @@ PASS는 실제 커널에서 Verify_Script로 실행한 결과가 있는 항목�
 | nomap 분류 카운터 일관성 | PASS | 네 부류의 합이 skip_nomap과 일치 (#10); #11 Verify 재확인 PASS |
 | nomap_other의 정체 | 정황 근거로 판단 | REQ_OP_DRV_IN, sr 드라이버, 약 2초 주기 2건. 디바이스 이름 직접 확인은 못 함 |
 | 부분 완료(nr_bytes 반영) 경로 | **미검증** | 코드 반영, #11 Verify 실행에서도 budget_cut=0으로 한 번도 실행되지 않음 |
-| 에러 completion 경로 | **미검증** | skip_error 카운터는 S1에서 추가했으나(구현됨) 에러 주입 실험을 하지 않았다. #11 Verify 실행에서 skip_error=0 |
-| 진입 계측 등식 (ctx 합 = rq_seen) | **미검증** | 구현됨. #11 Verify 실행 누적에서 2301 = 2301이었으나 Verify 항목이 없고 한 번의 관찰이다 |
-| skip_passthru 분리 | **미검증** | 구현됨. #11 Verify 실행 누적에서 skip_passthru=14, 출처 디바이스는 미확인. Verify 항목 없음 |
-| Deferred_Queue와 SAMON_Actuator (지연 조작) | **미검증** | 구현됨. #11 Verify 실행 누적에서 req_p5 = exec_p5 = 12, drop 전부 0, q_cur = 0이었으나 Verify 항목이 없는 한 번의 관찰이다 |
-| 패턴 감지 P1~P6 (Stream_Table, Loop_History, Reread_Table, 우선순위) | **미검증** | 구현됨 (S2, 9절). #11 Verify 실행 누적에서 det_p1..p6 = 2885, 0, 0, 1346, 18, 18574였으나 Verify 항목이 없고 의도한 패턴과의 대응은 확인하지 않았다 |
-| 패턴별 조작 토글 samon_act_p1~p4 (promote/demote) | **미검증** | 구현됨. 기본값 0이라 #11 Verify 실행에서는 켜지 않았고 동작 시험이 없다 |
+| 에러 completion 경로 | **미검증** | skip_error 카운터는 S1에서 추가했으나(구현됨) 에러 주입 실험을 하지 않았다. #11의 37개 항목 실행 누적에서 skip_error=1이 관찰됐으나 어떤 완료였는지 확인하지 않았다 |
+| 진입 계측 등식 (ctx 합 = rq_seen) | PASS | #11 Verify 신규 항목. sync 뒤 1초 대기 후 읽고, 불일치하면 최대 3회 다시 읽는다. hardirq 0 + softirq 235920 + task 0 = 235920 = rq_seen, 첫 읽기에 일치 |
+| skip_passthru 분리 | PASS | #11 Verify 신규 항목. 스크립트가 I/O를 내지 않는 10초 동안 +10 (sr0, sr1 존재, 기준 ≥ 1). 출처 디바이스는 직접 확인하지 않았다 |
+| 큐 회계 등식과 direct_ops | PASS | #11 Verify 신규 항목. wait_q0 뒤와 kdamond를 끈 뒤 모두 req_pN = exec_pN + drop 합 (N=1..5; p1 122659, p2 61899, p3 16384, p4 47681, p5 36), direct_ops = 0, 끈 뒤 q_cur = 0 |
+| Deferred_Queue 가득 참, stale·재검증 drop의 정확성, 실행 컨텍스트 | **미검증** | 누적 stats에 drop_queue, drop_revalidate가 0이 아닌 값으로 나타났으나 판정은 회계 등식뿐이다 |
+| 패턴 P1 순차 read 판정 | PASS | #11 Verify 신규 항목 세 가지. 단독: det_p1 +61312 (기준 ≥ 32768 = 파일 페이지의 50%), exec_p1 +38656 (기준 ≥ 1). 구간 내 랜덤(256MiB 읽기 칸이 살아 있을 때 4KB 랜덤 read): det_p1 +35 (기준 < det_p6 +62908의 5% = 3145.40), stream_r_restart +65501 (기준 ≥ 1). 랜덤 간섭 동시: det_p1 +61312 (기준 ≥ 32768) |
+| 패턴 P2 재읽기 판정 | PASS | #11 Verify 신규 항목. det_p2 +61899, exec_p2 +55026 (기준 각 ≥ 1), 두 번째 pass 시작 간격 4312 ms (기준 ≤ samon_reread_ms 10000 ms) |
+| 패턴 P3 loop 판정 | PASS | #11 Verify 신규 항목. det_p3 +16384, exec_p3 +10880 (기준 각 ≥ 1) |
+| 패턴 P4 순차 write 판정 | PASS | #11 Verify 신규 항목. det_p4 +47681, exec_p4 +26816 (기준 각 ≥ 1) |
+| 랜덤 read가 P1로 분류되지 않음 | PASS | #11 Verify 신규 항목. det_p1 +0 (기준 < det_p6 +65540의 5% = 3277.00) |
+| P5 판정 전용 항목, 표 칸 교체와 idle 정리 세부 | **미검증** | 구현됨 (S2, 9절). P5의 hot_w 판정은 위 기존 항목이 보지만 det_p5 건수는 판정하지 않는다 |
+| 패턴별 조작 토글 켬 (P1~P4) | PASS | #11 Verify 신규 항목. 위 P1~P4 시험이 각 토글을 켜고 exec_pN ≥ 1을 확인한다. 준비 단계의 읽기는 토글 0으로 하고 시험 토글은 마지막 캐시 비우기 뒤에 켠다 |
+| 패턴별 조작 토글 0 | PASS | #11 Verify 신규 항목. 토글 0으로 P1~P4를 다시 실행했을 때 req_pN, exec_pN이 N=1..5 모두 +0이고 det_pN은 계속 센다 (det_p1 +61312, det_p2 +63002, det_p3 +16384, det_p4 +51587) |
+| promote/demote가 page의 LRU 상태를 실제로 바꾸는지 | **미검증** | 요청·실행 건수만 확인했다. 실행 뒤 folio 상태는 읽지 않았다 |
 | samon_dbg_lba = 0에서 P5 비감지 | **미검증** | 코드 동작은 9절에 기술했으나 시험하지 않았다 |
-| debugfs streams, wb_hist, stats의 stream_* 줄 | **미검증** | 구현됨. 출력 형식 확인 실행을 하지 않았다 |
-| seg_buffered 새 정의 | **미검증** | 구현됨. #11 Verify 실행 누적에서 seg_buffered = det_p1..p6 합이었으나 Verify 항목이 없다 |
+| debugfs streams, wb_hist, stats의 stream_* 줄 | **미검증** | 구현됨. Verify 출력에 stream_* 줄이 나오는 것은 보였으나(info 줄) 판정 항목이 아니고 streams, wb_hist는 확인하지 않았다 |
+| seg_buffered 새 정의 | **미검증** | 구현됨. 구간 차분의 det_p1..p6 합과 seg_buffered 차분이 일치하는 것을 info 줄로 봤으나(#11 Verify 실행) 판정 항목이 아니다 |
 | 호출 컨텍스트 안전성 (6절 참조) | **미검증** | lockdep 등 검사 빌드로 확인한 적 없음. 지연 경로(S1)로 바뀐 뒤에도 같다 |
 | 고부하(fio 병렬) 락 경합과 오버헤드 | **미측정** | |
 | 장시간, 다중 CPU 동시성 | **미검증** | |
@@ -272,9 +283,9 @@ PASS는 실제 커널에서 Verify_Script로 실행한 결과가 있는 항목�
 
 ### 검증 실행 방법
 ```bash
-sudo bash verify_samon.sh /var/tmp/samon_verify
+sudo bash verify_samon.sh -d /var/tmp/samon_verify
 ```
-tmpfs가 아닌 실제 디스크 위의 디렉터리를 지정해야 한다. 마지막 줄에 PASS/FAIL 개수가 출력된다. nomap 분류 부분(섹션 8)은 부류별 개수를 보고만 하고 정체를 판정하지 않는다.
+-d 대신 디렉터리를 인자로 직접 줘도 된다. tmpfs가 아닌 실제 디스크 위의 디렉터리를 지정해야 한다. 마지막 줄에 `PASS=<n> FAIL=<n>`이 출력되고 종료 코드는 FAIL=0일 때만 0이다. fincore(util-linux-extra), fio, filefrag, gcc가 필요하다(fincore가 없으면 패턴 시험이 FAIL). 패턴 시험은 DIR에 256MiB 파일 두 개와 64MiB 파일 하나를 만들고, 시험 전에 kdamond를 off → on 하며, 끝나면 kdamond를 끈 상태로 둔다. /sys/class/block/sr*가 없으면 skip_passthru 항목은 [SKIP]이다. nomap 분류 부분(섹션 8)은 부류별 개수를 보고만 하고 정체를 판정하지 않는다.
 
 ### 실행 기록
 
@@ -285,7 +296,14 @@ tmpfs가 아닌 실제 디스크 위의 디렉터리를 지정해야 한다. 마
 | 2026-10-05 | #9 | 16개 항목 PASS (skip_pinned, 옵션 B 토글, 디스크 필터, kdamond 반복, probe 중복 검사 포함) |
 | 2026-10-05 | #10 | nomap 분류 합 일치 PASS. nomap_meta 가설은 기각. 총 17 PASS |
 | 2026-10-05 | #10 | 하네스 실행 직후 재실행에서 3개 FAIL (LBA 일치, 윈도우 리셋, 옵션 B). 원인은 코드가 아니라 트리 포화(drop_full 약 1332만)였으며, 검증이 빈 트리에서 시작하도록 스크립트를 고친 뒤 재실행하여 19개 모두 PASS (빈 트리 재시작, 포화 없음 확인 항목 포함) |
-| 2026-10-18 | #11 (S1+S2 합본 빌드) | 기존 verify_samon.sh 19개 항목 모두 PASS, 종료 코드 0. 출력은 /tmp/samon_13_2_verify.log. S1 기능(진입 계측, 지연 큐)을 확인하는 Verify 항목은 아직 없어 이 PASS는 S1 기능의 PASS 근거가 아니다. 워크로드별 ctx 차분은 미실행 |
+| 2026-10-18 | #11 (S1+S2 합본 빌드) | 기존 verify_samon.sh 19개 항목 모두 PASS, 종료 코드 0. 출력은 /tmp/samon_13_2_verify.log. 당시 스크립트에는 S1 기능(진입 계측, 지연 큐)을 확인하는 Verify 항목이 없어 이 PASS는 S1 기능의 PASS 근거가 아니다. 워크로드별 ctx 차분은 미실행 |
+| 2026-10-18 | #11 (S1+S2 합본 빌드, `uname -v`: #11 SMP PREEMPT_DYNAMIC Sun Oct 18 11:39:11 KST 2026) | verify_samon.sh 37개 항목(기존 19 + 신규 18) 모두 PASS, `PASS=37 FAIL=0`, 종료 코드 0, [FAIL]과 [SKIP] 없음. 명령은 `sudo bash kernel/verify_samon.sh -d /var/tmp/samon_verify`, 출력은 /var/tmp/samon_verify_run.txt. 재빌드 없음. 신규 18개는 S1 항목 2(ctx 합, skip_passthru), 패턴 시험 7(P1, 구간 내 랜덤, P1 + 간섭, P2, P3, P4, 랜덤 대조), 토글 0 재실행 4, 최종 회계 5 |
+
+참고 관찰 (#11, 37개 항목 실행. 판정 항목이 아니며 원인은 확인하지 않았다):
+
+- 마지막 stats의 skip_error = 1. 에러 주입은 하지 않았다.
+- 마지막 stats의 drop_full = 6625634. "트리 포화 없음" 항목은 패턴 시험 앞에서 판정하며, 이후 값이 늘었다. 패턴 시험이 256MiB 파일(65536개 4KB LBA)을 쓰는 구간이고 samon_max_entries 기본값도 65536이라 그 때문으로 보이나 구간별 차분은 보지 않았다. 패턴 판정은 LBA 트리와 별도의 표를 쓰지만, P5(hot write)는 트리 엔트리가 있어야 하므로 포화 구간의 P5 건수는 신뢰하지 않는다.
+- 기존 항목 8의 nomap 분류: slab 0, flagged 0, meta 12, other 4842, write 12 (skip_nomap 4854, 부팅 이후 누적). 같은 빌드의 앞선 실행 기록(nomap_other = 0)과 값 차이가 크고, 3절의 "passthrough는 nomap_other에 섞이지 않는다"는 서술과의 관계는 확인하지 않았다.
 
 ## 측정 하네스 (bench/, 준비됨, 아직 커널에서 실행하지 않음)
 
@@ -312,7 +330,7 @@ tmpfs가 아닌 실제 디스크 위의 디렉터리를 지정해야 한다. 마
 - direct I/O 판별은 folio 상태 기반이다. bio 플래그나 IOCB_DIRECT 같은 상위 컨텍스트는 block layer에서 접근할 수 없어 사용하지 않았다.
 - debugfs 출력은 트리 순회 동안 spinlock을 잡는다. samon_max_entries로 상한을 두었지만 엔트리가 매우 많으면 조회 중 지연이 생길 수 있다.
 - 콜백에서 segment마다 전역 spinlock(LBA 트리)을 잡고, P5 요청을 큐에 넣을 때 CPU별 큐 lock을 잡는다. 고부하에서의 오버헤드는 아직 측정하지 않았다.
-- Deferred_Queue는 kdamond 샘플링 주기마다 비운다. 주기보다 큐 항목이 빨리 쌓이면 samon_q_len에서 가득 차 drop_queue_p5로 버려진다. 실제 필요 크기(q_max_delay_us 등)는 측정하지 않았다 (S1 기능 전체가 미검증).
+- Deferred_Queue는 kdamond 샘플링 주기마다 비운다. 주기보다 큐 항목이 빨리 쌓이면 samon_q_len에서 가득 차 drop_queue_p5로 버려진다. 실제 필요 크기(q_max_delay_us 등)는 측정하지 않았다 (큐 회계 등식은 Verify PASS이나 필요한 크기는 측정하지 않았다).
 - 큐에 대기 중인 항목은 folio 참조를 잡고 있으므로 samon_q_max_ms 동안 해당 page 해제가 미뤄질 수 있다. 영향은 측정하지 않았다.
 - seg_buffered는 SAMON_Filter를 통과한 segment 수이고 트리 포화나 할당 실패로 항목을 못 만든 segment도 포함한다. 이전 빌드(#10 이하)의 seg_buffered와 값을 직접 비교할 수 없다.
 - 옵션 A/B/C 중 B를 기본 적용했으나, 확정은 사용자 결정 사항이다.
@@ -325,8 +343,8 @@ tmpfs가 아닌 실제 디스크 위의 디렉터리를 지정해야 한다. 마
 | 단계 | 내용 | 상태 |
 |---|---|---|
 | 11 | 관측 범위 확정 (nomap 분류) | 완료 |
-| 12 | 조작 컨텍스트 안전화와 계측 (콜백 컨텍스트 측정, skip_passthru, skip_error, 지연 조작 구조) | 구현됨, 미검증 (2026-10-18 기준 #11에 포함, Verify 항목은 S3에서 추가 예정. 워크로드별 ctx 차분 미실행) |
-| 13 | 영역 단위 집계, 패턴 분류, 엔트리 aging | 패턴 분류(P1~P6)만 구현됨, 미검증 (S2, #11에 포함, 9절). 영역 단위 집계와 엔트리 aging은 대기 (결정 게이트 A: aging을 먼저 넣을지 함께 할지) |
+| 12 | 조작 컨텍스트 안전화와 계측 (콜백 컨텍스트 측정, skip_passthru, skip_error, 지연 조작 구조) | 구현됨. ctx 합 = rq_seen, skip_passthru 증가, 큐 회계 등식은 #11 Verify PASS (2026-10-18, 37/37). 실행 컨텍스트 안전성과 skip_error 경로는 미검증, 워크로드별 ctx 차분 미실행 |
+| 13 | 영역 단위 집계, 패턴 분류, 엔트리 aging | 패턴 분류(P1~P6)만 구현됨. P1~P4 판정과 토글별 요청·실행 건수는 #11 Verify PASS, P5 판정 전용과 효과는 미검증 (S2, 9절). 영역 단위 집계와 엔트리 aging은 대기 (결정 게이트 A: aging을 먼저 넣을지 함께 할지) |
 | 14 | 정책 판단 (promote/유지/demote, 불확실하면 기본 LRU로 폴백) | 대기 (결정 게이트 B) |
 | 15 | 조작 프리미티브 (promote, demote, read 쪽 조작) | 대기 (결정 게이트 B) |
 | 16 | 효과 측정 (수정된 하네스 실행) | 하네스 준비됨, 수정본은 미실행 |
