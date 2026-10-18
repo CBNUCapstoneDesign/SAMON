@@ -33,6 +33,7 @@ eBPF 기반 유저스페이스 스크립트(samon_probe.py, samon_monitor.py 등
 | damon_Kconfig | mm/damon/Kconfig 대체본 (CONFIG_DAMON_SADDR 추가) |
 | verify_samon.sh | 기능 검증 스크립트 (root 권한, 재부팅 후 실행) |
 | test_pinned.c | verify_samon.sh가 컴파일해서 쓰는 테스트. mmap한 파일 페이지를 소스로 하는 O_DIRECT write |
+| samon_qlen_sweep.sh | samon_q_len별 큐 유실(drop_queue) 측정 (root 권한). P1, P4, P3 시험만 하고, 끝나면 q_len과 토글을 되돌리고 kdamond를 끈다 |
 | ../bench/samon_bench.sh, ../bench/summarize.py | 측정 하네스 (아래 참조) |
 
 ## 적용 방법
@@ -64,7 +65,7 @@ cat /sys/kernel/debug/samon/stats
 | samon_hot_threshold | 10 | 윈도우 안에서 이 횟수 이상 발생하면 hot으로 판정 |
 | samon_window_ms | 1000 | 빈도수를 세는 관측 윈도우(ms) |
 | samon_opt_b | 1 | 옵션 B 토글(P5 동작). 0이면 hot write에서도 folio_mark_accessed() 요청을 큐에 넣지 않는다 (효과 비교용). 즉시 반영 |
-| samon_q_len | 1024 | CPU마다 두는 Deferred_Queue 칸 수 (1 이상, 0은 거부). 다음 kdamond 시작 때 적용 |
+| samon_q_len | 1024 | CPU마다 두는 Deferred_Queue 칸 수 (1 이상, 0은 거부). 다음 kdamond 시작 때 적용. 커널 기본값은 1024이지만 확정값은 8192이며 Verify가 시작할 때 8192를 쓴다 ("Deferred_Queue 크기 결정" 참조) |
 | samon_q_max_ms | 100 | 큐에서 이 시간(ms) 넘게 기다린 항목은 실행하지 않고 stale로 버린다. 즉시 반영 |
 | samon_dev_major, samon_dev_minor | 0, 0 | 관측 대상 디스크(whole disk의 major, first_minor). major가 0이면 모든 디바이스를 관측한다 |
 | samon_max_entries | 65536 | LBA 트리에 보관하는 엔트리 상한 (메모리 상한) |
@@ -233,7 +234,7 @@ segment마다 정확히 하나의 패턴을 판정하고 det_pN을 센다(토글
 
 ## 검증 상태
 
-PASS는 실제 커널에서 Verify_Script로 실행한 결과가 있는 항목만 해당한다. 아래 표의 PASS 행은 read/write 카운터 분리 행(#11 전용 항목 없음)을 빼고 모두 #11(현재 설치된 빌드)의 Verify 37/37 PASS에 포함된다. 환경은 VMware VM, ext4(/dev/sda2, 파티션 시작 섹터 4096, 블록 4096바이트), 메모리 8GB이며 커널 6.8.0-SAMON이다.
+PASS는 실제 커널에서 Verify_Script로 실행한 결과가 있는 항목만 해당한다. 아래 표의 PASS 행은 read/write 카운터 분리 행(#11 전용 항목 없음)을 빼고 모두 #11의 Verify 37/37 PASS에 포함되며, 표의 수치는 #11 실행 값이다. 현재 설치된 빌드는 #12(F1·F2·F3·F8 수정 포함)이고 #12에서도 Verify 37/37 PASS였다(실행 기록 참조). 환경은 VMware VM, ext4(/dev/sda2, 파티션 시작 섹터 4096, 블록 4096바이트), 메모리 8GB이며 커널 6.8.0-SAMON이다.
 
 ### 항목별 상태
 
@@ -298,12 +299,35 @@ sudo bash verify_samon.sh -d /var/tmp/samon_verify
 | 2026-10-05 | #10 | 하네스 실행 직후 재실행에서 3개 FAIL (LBA 일치, 윈도우 리셋, 옵션 B). 원인은 코드가 아니라 트리 포화(drop_full 약 1332만)였으며, 검증이 빈 트리에서 시작하도록 스크립트를 고친 뒤 재실행하여 19개 모두 PASS (빈 트리 재시작, 포화 없음 확인 항목 포함) |
 | 2026-10-18 | #11 (S1+S2 합본 빌드) | 기존 verify_samon.sh 19개 항목 모두 PASS, 종료 코드 0. 출력은 /tmp/samon_13_2_verify.log. 당시 스크립트에는 S1 기능(진입 계측, 지연 큐)을 확인하는 Verify 항목이 없어 이 PASS는 S1 기능의 PASS 근거가 아니다. 워크로드별 ctx 차분은 미실행 |
 | 2026-10-18 | #11 (S1+S2 합본 빌드, `uname -v`: #11 SMP PREEMPT_DYNAMIC Sun Oct 18 11:39:11 KST 2026) | verify_samon.sh 37개 항목(기존 19 + 신규 18) 모두 PASS, `PASS=37 FAIL=0`, 종료 코드 0, [FAIL]과 [SKIP] 없음. 명령은 `sudo bash kernel/verify_samon.sh -d /var/tmp/samon_verify`, 출력은 /var/tmp/samon_verify_run.txt. 재빌드 없음. 신규 18개는 S1 항목 2(ctx 합, skip_passthru), 패턴 시험 7(P1, 구간 내 랜덤, P1 + 간섭, P2, P3, P4, 랜덤 대조), 토글 0 재실행 4, 최종 회계 5 |
+| 2026-10-18 | #12 (`uname -v`: #12 SMP PREEMPT_DYNAMIC Sun Oct 18 18:40:01 KST 2026, data 없는 bio 건너뛰기·saddr owner 하나·q_max_delay_us u64 계산 반영) | User 실행 보고: `PASS=37 FAIL=0`. 당시 DEFAULTS의 samon_q_len=1024에서 큐 유실이 컸다: req 대비 drop_queue P1 36063/115747(31%), P3 5120/16384(31%), P4 21696/48256(45%). ctx_softirq=322299, ctx_hardirq=0, ctx_task=0. 이어서 samon_qlen_sweep.sh를 실행했다("Deferred_Queue 크기 결정") |
 
 참고 관찰 (#11, 37개 항목 실행. 판정 항목이 아니며 원인은 확인하지 않았다):
 
 - 마지막 stats의 skip_error = 1. 에러 주입은 하지 않았다.
 - 마지막 stats의 drop_full = 6625634. "트리 포화 없음" 항목은 패턴 시험 앞에서 판정하며, 이후 값이 늘었다. 패턴 시험이 256MiB 파일(65536개 4KB LBA)을 쓰는 구간이고 samon_max_entries 기본값도 65536이라 그 때문으로 보이나 구간별 차분은 보지 않았다. 패턴 판정은 LBA 트리와 별도의 표를 쓰지만, P5(hot write)는 트리 엔트리가 있어야 하므로 포화 구간의 P5 건수는 신뢰하지 않는다.
 - 기존 항목 8의 nomap 분류: slab 0, flagged 0, meta 12, other 4842, write 12 (skip_nomap 4854, 부팅 이후 누적). 같은 빌드의 앞선 실행 기록(nomap_other = 0)과 값 차이가 크고, 3절의 "passthrough는 nomap_other에 섞이지 않는다"는 서술과의 관계는 확인하지 않았다.
+
+참고 관찰 (#12, samon_qlen_sweep.sh. 판정 항목이 아니다):
+
+- P4는 큐 유실이 없는 q_len(4096 이상)에서도 exec_p4/req_p4가 55~74%이다(4096: 38004/62656, 8192: 47976/64576, 16384: 35459/64192). 스윕은 drop_revalidate를 따로 기록하지 않으므로 나머지는 소거법으로 drop_revalidate로 본다: drop_queue는 0, q_max_delay_us 최대 7000µs가 samon_q_max_ms(100ms)보다 짧아 stale이 아니며, 토글은 구간 동안 1이고 kdamond 재시작은 구간 밖이다. 재검증 조건 중 무엇(PG_lru 없음, dirty, writeback 등)에 걸렸는지는 구분하지 않았고 원인은 확인하지 않았다. P1, P3는 같은 조건에서 exec = req이다.
+
+### Deferred_Queue 크기 결정 (samon_q_len = 8192, #12)
+
+근거:
+
+- 완료 CPU가 하나로 몰린다. sda(LSI 컨트롤러, PCI 00:10.0)의 인터럽트는 IRQ 17(`ioc0`, ehci_hcd와 공유)이고, /proc/interrupts 누적값 338552건이 모두 CPU1에 있었으며 /proc/irq/17/effective_affinity_list도 1이었다(2026-10-18, 부팅 후 누적값을 한 번 읽음. I/O 구간 차분은 재지 않았다). sda의 하드웨어 큐는 1개(/sys/block/sda/mq/0)이고 rq_affinity = 1이다. 6.8 block/blk-mq.c:1154-1178(blk_mq_complete_need_ipi)은 제출 CPU와 캐시를 공유하면 IPI 없이 인터럽트 CPU에서 완료하므로, 완료는 CPU1의 BLOCK softirq에서 처리되고 #12 Verify의 ctx도 softirq 322299, hardirq 0, task 0이었다. 콜백은 자기 CPU 큐에만 넣으므로 4 vCPU 중 CPU1의 큐 하나만 쓰인다.
+- kdamond는 sample interval(5000µs)마다 큐를 비운다. q_max_delay_us 5000~7000µs가 이와 맞는다. 그 사이 dd 순차 read·write가 1024 페이지를 넘게 완료하면 CPU1 큐가 차서 drop_queue로 버려진다. 회계 등식은 유지되므로 버그가 아니라 크기 부족이다.
+
+스윕 결과(kernel/samon_qlen_sweep.sh, #12, 2026-10-18 19:40, sample_us=5000, nproc=4, CSV /var/tmp/samon_qlen_sweep/qlen_sweep_20261018-194018.csv. 시험마다 kdamond를 다시 켜므로 q_max_delay_us는 그 시험의 최댓값):
+
+| samon_q_len | P1 req / drop_queue (유실 %) | P4 req / drop_queue (유실 %) | P3 req / drop_queue (유실 %) | q_max_delay_us (P1/P4/P3) | 세 패턴 모두 1% 미만 |
+|---|---|---|---|---|---|
+| 1024 | 64768 / 32256 (49.80) | 61888 / 34975 (56.51) | 16384 / 6400 (39.06) | 6000 / 6000 / 5000 | 아니오 |
+| 4096 | 64768 / 0 (0.00) | 62656 / 0 (0.00) | 16384 / 0 (0.00) | 6000 / 6000 / 6000 | 예 |
+| 8192 | 64768 / 0 (0.00) | 64576 / 0 (0.00) | 16384 / 0 (0.00) | 6000 / 7000 / 5000 | 예 |
+| 16384 | 64768 / 0 (0.00) | 64192 / 0 (0.00) | 16384 / 0 (0.00) | 7000 / 6000 / 5000 | 예 |
+
+8192를 고른 이유: 통과하는 최솟값은 4096이다. 측정 워크로드(요구사항 11)는 단일 dd보다 동시 잡이 많아 한 sample interval에 몰리는 완료 수가 늘 수 있으므로 User가 2배 여유를 두어 8192로 확정했다(2026-10-18). 메모리는 CPU당 ring + drain 2 × 8192 × 24 B = 384 KiB, 4 vCPU에서 1.5 MiB이다. 커널 상수 SAMON_DEF_Q_LEN은 1024 그대로이며 Verify DEFAULTS가 8192를 명시적으로 쓴다. 측정 워크로드에서 실제로 유실이 1% 미만인지는 아직 확인하지 않았다(하네스 q_warn으로 확인한다).
 
 ## 측정 하네스 (bench/, 준비됨, 아직 커널에서 실행하지 않음)
 
@@ -330,7 +354,7 @@ sudo bash verify_samon.sh -d /var/tmp/samon_verify
 - direct I/O 판별은 folio 상태 기반이다. bio 플래그나 IOCB_DIRECT 같은 상위 컨텍스트는 block layer에서 접근할 수 없어 사용하지 않았다.
 - debugfs 출력은 트리 순회 동안 spinlock을 잡는다. samon_max_entries로 상한을 두었지만 엔트리가 매우 많으면 조회 중 지연이 생길 수 있다.
 - 콜백에서 segment마다 전역 spinlock(LBA 트리)을 잡고, P5 요청을 큐에 넣을 때 CPU별 큐 lock을 잡는다. 고부하에서의 오버헤드는 아직 측정하지 않았다.
-- Deferred_Queue는 kdamond 샘플링 주기마다 비운다. 주기보다 큐 항목이 빨리 쌓이면 samon_q_len에서 가득 차 drop_queue_p5로 버려진다. 실제 필요 크기(q_max_delay_us 등)는 측정하지 않았다 (큐 회계 등식은 Verify PASS이나 필요한 크기는 측정하지 않았다).
+- Deferred_Queue는 kdamond 샘플링 주기마다 비운다. 주기보다 큐 항목이 빨리 쌓이면 samon_q_len에서 가득 차 drop_queue_pN으로 버려진다. 이 VM은 디스크 완료가 CPU1 하나에 몰려 CPU 큐 하나만 쓰이며, 단일 dd 순차 시험에서 1024칸은 39~57%를 잃었고 4096칸 이상은 0%였다(위 "Deferred_Queue 크기 결정"). 측정 워크로드에서의 유실은 아직 확인하지 않았다.
 - 큐에 대기 중인 항목은 folio 참조를 잡고 있으므로 samon_q_max_ms 동안 해당 page 해제가 미뤄질 수 있다. 영향은 측정하지 않았다.
 - seg_buffered는 SAMON_Filter를 통과한 segment 수이고 트리 포화나 할당 실패로 항목을 못 만든 segment도 포함한다. 이전 빌드(#10 이하)의 seg_buffered와 값을 직접 비교할 수 없다.
 - debugfs streams를 읽을 때마다 스냅샷 버퍼를 kvcalloc(GFP_KERNEL)으로 할당하며 그동안 sa_ctx_lock을 잡는다. 설계(K10, 표 lock 아래 직접 출력)와 다르고, 메모리 압박 시 kdamond의 region map 갱신이 그만큼 늦어질 수 있다.

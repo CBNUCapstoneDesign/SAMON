@@ -15,9 +15,11 @@ IDLE_HOLD_MS=600000    # samon_stream_idle_ms during the in-range random test;
 # ---- module parameter defaults (R9.1; = the SAMON_DEF_* constants of
 # kernel/saddr.c, appendix A confirmed values).  Written at start-up, in this
 # order, before the first kdamond off->on.
+# Exception: samon_q_len=8192 (User decision 2026-10-18, kernel/samon_qlen_sweep.sh
+# on #12) while SAMON_DEF_Q_LEN in saddr.c stays 1024; this script writes it.
 DEFAULTS="samon_act_p1=0 samon_act_p2=0 samon_act_p3=0 samon_act_p4=0 samon_opt_b=1
 samon_dev_major=0 samon_dev_minor=0 samon_dbg_lba=1
-samon_q_len=1024 samon_q_max_ms=100 samon_stream_slots=16 samon_loop_slots=16
+samon_q_len=8192 samon_q_max_ms=100 samon_stream_slots=16 samon_loop_slots=16
 samon_reread_slots=65536 samon_seq_min=4 samon_stream_new_kb=64 samon_stream_gap_req=2
 samon_stream_idle_ms=1000 samon_loop_min_kb=8192 samon_loop_protect_pct=50
 samon_reread_ms=10000"
