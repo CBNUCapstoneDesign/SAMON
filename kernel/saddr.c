@@ -383,6 +383,16 @@ static unsigned int samon_nr_entries;	/* protected by samon_lba_lock */
 static bool samon_probe_registered;
 
 /*
+ * The one saddr kdamond that owns the SAMON state (probe, Deferred_Queue,
+ * pattern tables).  Set in damon_sa_init() and cleared at the end of
+ * damon_sa_cleanup(), both under sa_ctx_lock and on the owner's own
+ * kthread.  Another saddr kdamond started meanwhile leaves the SAMON state
+ * alone; it only compares its ctx with this pointer (READ_ONCE), which can
+ * never equal its own ctx.
+ */
+static struct damon_ctx *samon_owner;
+
+/*
  * Deferred_Queue state.  The queue and its size are allocated in
  * damon_sa_init() before the probe is registered and freed in
  * damon_sa_cleanup() after tracepoint_synchronize_unregister(); the probe
@@ -792,13 +802,13 @@ static struct samon_stream *samon_pick_slot(struct samon_stream *T)
 
 /*
  * Called right before a read slot is cleared or replaced (R8.13).  If its
- * length reached samon_loop_min_kb, record it in Loop_History at the
- * circular cursor.  Recording and clearing happen in the same lock hold, so
- * a slot is recorded at most once.
+ * length reached @min (samon_loop_min_kb in sectors, read once by the
+ * caller), record it in Loop_History at the circular cursor.  Recording and
+ * clearing happen in the same lock hold, so a slot is recorded at most once.
  */
-static void samon_loop_retire(struct samon_stream *x)
+static void samon_loop_retire(struct samon_stream *x, sector_t min)
 {
-	if (x->end - x->start >= (sector_t)READ_ONCE(samon_loop_min_kb) * 2) {
+	if (x->end - x->start >= min) {
 		struct samon_loop_rec *h = &samon_loops[samon_loop_next];
 
 		*h = (struct samon_loop_rec){
@@ -817,13 +827,14 @@ static void samon_loop_retire(struct samon_stream *x)
  * Loop check of a newly created read slot @n (R8.15): (b) live read slots
  * first, then (a) Loop_History.  Same dev and same start sector is a match;
  * among several matches on one side the latest t_start wins.  A (b) match
- * is retired (recorded and cleared); an (a) record is kept.
+ * is retired (recorded and cleared); an (a) record is kept.  @min is
+ * samon_loop_min_kb in sectors, read once by the caller.
  */
-static void samon_loop_match(struct samon_stream *n, unsigned long now)
+static void samon_loop_match(struct samon_stream *n, unsigned long now,
+			     sector_t min)
 {
 	struct samon_stream *live = NULL;
 	struct samon_loop_rec *hist = NULL;
-	sector_t min = (sector_t)READ_ONCE(samon_loop_min_kb) * 2;
 	unsigned int i;
 
 	for (i = 0; i < samon_streams_n; i++) {
@@ -848,7 +859,7 @@ static void samon_loop_match(struct samon_stream *n, unsigned long now)
 		n->loop = 1;
 		n->loop_len = live->end - live->start;
 		n->period = now - live->t_start;
-		samon_loop_retire(live);	/* length already >= min */
+		samon_loop_retire(live, min);	/* length already >= min */
 	} else if (hist) {
 		n->loop = 1;
 		n->loop_len = hist->end - hist->start;
@@ -900,6 +911,7 @@ static void samon_stream_update(int dir, dev_t devt, sector_t s, sector_t n,
 	struct samon_stream *ext = NULL, *pre = NULL, *fil = NULL;
 	sector_t e = s + n;
 	sector_t gap = (sector_t)READ_ONCE(samon_stream_gap_req) * n;
+	sector_t min = (sector_t)READ_ONCE(samon_loop_min_kb) * 2;
 	unsigned long now = jiffies, flags;
 	int X = dir == READ ? 0 : 1;
 	unsigned int i;
@@ -946,7 +958,7 @@ static void samon_stream_update(int dir, dev_t devt, sector_t s, sector_t n,
 			if (x->used) {
 				atomic64_inc(&samon_st_stream[X][SAMON_SEV_EVICT]);
 				if (dir == READ)
-					samon_loop_retire(x);
+					samon_loop_retire(x, min);
 			}
 			*x = (struct samon_stream){
 				.used    = 1,
@@ -959,7 +971,7 @@ static void samon_stream_update(int dir, dev_t devt, sector_t s, sector_t n,
 			};
 			atomic64_inc(&samon_st_stream[X][SAMON_SEV_NEW_SLOT]);
 			if (dir == READ)
-				samon_loop_match(x, now);
+				samon_loop_match(x, now, min);
 		}
 	}
 
@@ -1125,7 +1137,12 @@ static void samon_handle_rq(struct request *rq, int dir, dev_t devt,
 	__rq_for_each_bio(bio, rq) {
 		struct bio_vec bv;
 		struct bvec_iter iter;
-		sector_t lba = bio->bi_iter.bi_sector;
+		sector_t lba;
+
+		/* discard / secure erase / write zeroes: bi_io_vec may be NULL */
+		if (!bio_has_data(bio))
+			continue;
+		lba = bio->bi_iter.bi_sector;
 
 		bio_for_each_segment(bv, bio, iter) {
 			struct folio *folio;
@@ -1455,6 +1472,14 @@ static void damon_sa_init(struct damon_ctx *ctx)
 	for (i = 0; i < DAMON_SA_MAX_REGIONS; i++)
 		atomic_set(&sa_ctx.io_counts[i], 0);
 	WRITE_ONCE(sa_ctx.nr_regions, 0);
+
+	/* Only one saddr kdamond owns the probe, queue and tables. */
+	if (samon_owner) {
+		pr_warn("another saddr kdamond owns SAMON; this one runs without probe, queue and tables\n");
+		goto unlock;
+	}
+	WRITE_ONCE(samon_owner, ctx);
+
 	WRITE_ONCE(samon_q_max_delay_us, 0);
 
 	/* kdamond may be restarted: never register the probe twice */
@@ -1559,7 +1584,8 @@ static void samon_process(const struct samon_qitem *it, struct samon_qacct *b)
 	}
 
 	/* only this kthread writes it; stats readers use READ_ONCE */
-	us = jiffies_to_usecs(now - it->t_req);
+	/* u64 math: jiffies_to_usecs() returns unsigned int and would wrap */
+	us = (u64)(now - it->t_req) * (USEC_PER_SEC / HZ);
 	if (us > READ_ONCE(samon_q_max_delay_us))
 		WRITE_ONCE(samon_q_max_delay_us, us);
 
@@ -1626,7 +1652,7 @@ static void samon_idle_sweep(void)
 
 		if (x->used && time_after_eq(now, x->t_last + idle) &&
 		    x->end - x->start >= min)
-			samon_loop_retire(x);
+			samon_loop_retire(x, min);
 	}
 	spin_unlock_irqrestore(&samon_pat_lock, flags);
 }
@@ -1636,8 +1662,9 @@ static void damon_sa_prepare_access_checks(struct damon_ctx *ctx)
 	int i;
 
 	/* S1: consume the Deferred_Queue first (kdamond, process context).
-	 * samon_ready is only set between init and cleanup of this kthread. */
-	if (READ_ONCE(samon_ready)) {
+	 * Only the owner kdamond does it; samon_ready is only set between
+	 * init and cleanup of the owner's kthread. */
+	if (ctx == READ_ONCE(samon_owner) && READ_ONCE(samon_ready)) {
 		samon_actuate();
 		samon_idle_sweep();	/* S2, R8.14 */
 	}
@@ -1676,6 +1703,11 @@ static unsigned int damon_sa_check_accesses(struct damon_ctx *ctx)
 static void damon_sa_cleanup(struct damon_ctx *ctx)
 {
 	mutex_lock(&sa_ctx_lock);
+	/* A kdamond that does not own SAMON has nothing to stop or free. */
+	if (ctx != samon_owner) {
+		mutex_unlock(&sa_ctx_lock);
+		return;
+	}
 	if (samon_probe_registered) {
 		unregister_trace_block_rq_complete(damon_sa_bio_trace, NULL);
 		samon_probe_registered = false;
@@ -1694,6 +1726,11 @@ static void damon_sa_cleanup(struct damon_ctx *ctx)
 	mutex_unlock(&sa_ctx_lock);
 
 	samon_lba_tree_free();
+
+	/* SAMON fully stopped: the next saddr kdamond may own it. */
+	mutex_lock(&sa_ctx_lock);
+	WRITE_ONCE(samon_owner, NULL);
+	mutex_unlock(&sa_ctx_lock);
 }
 
 static int damon_sa_scheme_score(struct damon_ctx *c, struct damon_target *t,

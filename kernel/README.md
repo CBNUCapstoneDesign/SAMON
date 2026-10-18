@@ -333,8 +333,15 @@ sudo bash verify_samon.sh -d /var/tmp/samon_verify
 - Deferred_Queue는 kdamond 샘플링 주기마다 비운다. 주기보다 큐 항목이 빨리 쌓이면 samon_q_len에서 가득 차 drop_queue_p5로 버려진다. 실제 필요 크기(q_max_delay_us 등)는 측정하지 않았다 (큐 회계 등식은 Verify PASS이나 필요한 크기는 측정하지 않았다).
 - 큐에 대기 중인 항목은 folio 참조를 잡고 있으므로 samon_q_max_ms 동안 해당 page 해제가 미뤄질 수 있다. 영향은 측정하지 않았다.
 - seg_buffered는 SAMON_Filter를 통과한 segment 수이고 트리 포화나 할당 실패로 항목을 못 만든 segment도 포함한다. 이전 빌드(#10 이하)의 seg_buffered와 값을 직접 비교할 수 없다.
+- debugfs streams를 읽을 때마다 스냅샷 버퍼를 kvcalloc(GFP_KERNEL)으로 할당하며 그동안 sa_ctx_lock을 잡는다. 설계(K10, 표 lock 아래 직접 출력)와 다르고, 메모리 압박 시 kdamond의 region map 갱신이 그만큼 늦어질 수 있다.
+- samon_stream_slots, samon_loop_slots, samon_q_len, samon_reread_slots에는 상한이 없다. 슬롯 수를 크게 주면 완료 콜백에서 irq를 끈 채 표 선형 탐색이 길어지고, q_len·reread_slots를 크게 주면 CPU별 할당 합이 RAM을 넘어도 걸러지지 않아 OOM-kill이 날 수 있다. 기본값 근처에서만 쓴다.
+- wb_hist는 디스크를 알 수 있고(devt ≠ 0) 큐·표 할당이 끝난 상태에서 판정된 write segment만 센다. 요구사항 8 기준 21의 "모든 SAMON_Filter 통과 write segment"와 다르지만 sda 환경에서는 값이 같다.
 - 옵션 A/B/C 중 B를 기본 적용했으나, 확정은 사용자 결정 사항이다.
 - 엔트리가 만료되지 않는다. 트리가 samon_max_entries에 도달하면 이후 새 LBA는 기록되지 않고(drop_full 증가) kdamond를 껐다 켜서 트리를 비우기 전까지 복구되지 않는다. 이 때문에 검증 스크립트가 빈 트리에서 시작하도록 고쳤고, 큰 데이터셋을 쓰는 측정에서는 samon_max_entries를 올려야 한다. 오래된 엔트리를 주기적으로 정리하는 aging은 아직 구현하지 않았다.
+
+### 확인하지 못한 것
+
+- sda는 discard 미지원(fstrim: the discard operation is not supported). 그래서 discard·write-zeroes·secure-erase bio를 건너뛰는 경로(bio_has_data 검사)는 이 VM에서 실행된 적이 없다.
 
 ## 남은 개발
 
