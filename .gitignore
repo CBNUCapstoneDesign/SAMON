@@ -5,3 +5,4 @@ __pycache__/
 *.md
 !README.md
 bench/results/
+bench/.venv

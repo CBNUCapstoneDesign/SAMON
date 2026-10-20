@@ -1,6 +1,10 @@
-# SAMON Workloads
+# SAMON Workloads (초기 히트맵용)
 
 6가지 벤치마크 워크로드. 각각 다른 I/O 패턴을 발생시켜 SAMON 히트맵에서 시각적으로 구분 가능.
+
+> 이 디렉터리는 초기 프로토타입(eBPF 모니터, samon_kernel_monitor.py 히트맵)용이다. 검증과 측정에 쓰는 워크로드는 여기가 아니라 `bench/samon_workloads.sh`(mixed, reread, loop, seqwrite와 Verify 형태 p1~p4, rand)에 있다.
+>
+> saddr의 LBA to page 연동과 패턴 감지(P1~P6)는 buffered I/O만 본다. direct I/O segment는 skip_anon/skip_pinned로 걸러진다. 아래 워크로드 중 run_fio.sh, run_sysbench.sh와 run_dbbench.sh의 read·flush·compaction은 direct I/O라 패턴 감지와 page 조작에는 잡히지 않고, region 카운터 경로(samon_kernel_monitor.py가 읽는 damon_aggregated의 nr_accesses)에만 반영된다. region 카운터는 segment 필터 앞에서 세므로 direct I/O도 포함한다(saddr.c samon_legacy_region_count). 스크립트의 설정만 보고 판단했으며 실행해서 확인하지는 않았다.
 
 ## 사전 요구사항
 
@@ -51,6 +55,6 @@ python3 samon_plot.py result.csv -o heatmap.png
 
 ## 주의사항
 
-- 모든 워크로드는 `--direct=1` 또는 동등한 설정으로 page cache를 우회
+- run_fio.sh(`--direct=1`), run_sysbench.sh(`--file-extra-flags=direct`)는 page cache를 우회한다. run_dbbench.sh는 read와 flush·compaction에 direct I/O를 쓴다(`--use_direct_reads=true`, `--use_direct_io_for_flush_and_compaction=true`). run_pgbench.sh, btree_workload.py, zipfian_workload.py에는 direct 설정이 없다(zipfian_workload.py 설명의 "direct I/O characteristics"는 설정이 아니라 설명 문구)
 - pgbench는 사전에 DB 초기화 필요 (위 사전 요구사항 참조)
 - 워크로드 실행 전 `sync; echo 3 > /proc/sys/vm/drop_caches`로 캐시 비우면 패턴이 더 명확
