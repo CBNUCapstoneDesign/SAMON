@@ -1,0 +1,49 @@
+#!/usr/bin/env bpftrace
+/*
+ * samon_trace.bt — S0 block trace 수집 스크립트
+ *
+ * 측정 도구, 구현의 기반 아님.
+ * SAMON 커널 구현(mm/damon/saddr.c)은 이 스크립트나 bpftrace에 의존하지 않는다.
+ * S0에서 패턴 규칙을 오프라인 재현(bench/samon_replay.py)하기 위한 입력만 만든다.
+ *
+ * 사용법: sudo bpftrace bench/samon_trace.bt <major> <minor>
+ *   예: sudo bpftrace bench/samon_trace.bt 8 0      (sda)
+ *
+ * 출력 줄 형식(필드 7개, 공백 구분):
+ *   <I|C> <ts_ns> <cpu> <major:minor> <sector> <nr_sector> <rwbs>
+ *   I = block_rq_issue, C = block_rq_complete
+ *   ts_ns = nsecs(ktime_get_ns), sector·nr_sector = 512바이트 단위
+ *
+ * dev 필터 외의 온라인 계산과 map 집계(count, hist 등)는 하지 않는다.
+ * 커널 내부 dev_t는 MKDEV(ma, mi) = (ma << 20) | mi 이다.
+ * per-CPU 버퍼 때문에 줄이 시각 순이 아닐 수 있다. 정렬은 Replay_Script가 한다.
+ *
+ * 필드 이름(dev, sector, nr_sector, rwbs)은 Linux 6.8
+ * include/trace/events/block.h의 block_rq(issue)와 block_rq_completion(complete)
+ * 클래스 정의를 따른다. 실제 이름은 `bpftrace -lv`로 다시 확인한다.
+ */
+
+BEGIN
+{
+	if ($# != 2) {
+		printf("usage: bpftrace samon_trace.bt <major> <minor>\n");
+		exit();
+	}
+	printf("# samon_trace v1 dev=%d:%d\n", $1, $2);
+}
+
+tracepoint:block:block_rq_issue
+/ args.dev == (($1 << 20) | $2) /
+{
+	printf("I %llu %u %d:%d %llu %u %s\n", nsecs, cpu,
+	       args.dev >> 20, args.dev & 0xfffff,
+	       args.sector, args.nr_sector, args.rwbs);
+}
+
+tracepoint:block:block_rq_complete
+/ args.dev == (($1 << 20) | $2) /
+{
+	printf("C %llu %u %d:%d %llu %u %s\n", nsecs, cpu,
+	       args.dev >> 20, args.dev & 0xfffff,
+	       args.sector, args.nr_sector, args.rwbs);
+}
