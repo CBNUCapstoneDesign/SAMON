@@ -3,7 +3,9 @@
 
 saddr가 내보내는 debugfs 파일을 주기적으로 읽어 터미널에 보여 준다.
   /sys/kernel/debug/samon/stats    누적 카운터 -> 초당 변화량
-  /sys/kernel/debug/samon/streams  Stream_Table, Loop_History
+  /sys/kernel/debug/samon/streams  Stream_Table, Loop_History (요청 단위 판정, samon_classifier=0)
+  /sys/kernel/debug/samon/regions  Region_Classifier 라벨 표 (DAMON adaptive region 기반 판정,
+                                   samon_classifier=1). 오른쪽 위 패널은 판정 방식에 맞춰 둘 중 하나를 보인다
   /sys/kernel/debug/samon/wb_hist  최근 60초 write segment 수
   /sys/fs/cgroup/<cg>/memory.stat  --cgroup으로 고른 cgroup(기본 samon_on, samon_off)의 page cache
                                    LRU 상태(active_file, inactive_file, pgactivate, pgdeactivate)
@@ -140,6 +142,30 @@ def parse_streams(text: str) -> tuple[dict[str, str], list[dict[str, str]], list
     return head, slots, loops
 
 
+REGION_COLS = ("start", "end", "acc", "rd_big", "rd_small", "wr_big", "wr_small",
+               "rd_kb", "wr_kb", "flags", "last_scan", "span_start", "span_len")
+
+
+def parse_regions(text: str) -> tuple[dict[str, int], list[dict]]:
+    """regions 파일 -> (머리 줄 값 iv·nr·max_acc·classifier, region 행 목록). saddr.c samon_regions_show() 형식."""
+    head: dict[str, int] = {}
+    rows: list[dict] = []
+    for line in text.splitlines():
+        if line.startswith("# iv="):
+            for k, v in _KV_RE.findall(line):
+                if v.isdigit():
+                    head[k] = int(v)
+            continue
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) != len(REGION_COLS):
+            continue
+        rows.append({k: (v if k == "flags" else (int(v) if v.isdigit() else 0))
+                     for k, v in zip(REGION_COLS, parts)})
+    return head, rows
+
+
 def parse_wb_hist(text: str) -> list[int]:
     """wb_hist 파일 -> 오래된 구간부터의 write 수 목록."""
     vals: list[tuple[int, int]] = []
@@ -249,6 +275,7 @@ class Sampler:
     def __init__(self, args: argparse.Namespace):
         self.a = args
         self.stats: dict[str, int] = {}
+        self.regions: tuple[dict[str, int], list[dict]] | None = None
         self.base: dict[str, int] | None = None
         self.prev: dict[str, int] | None = None
         self.prev_t: float | None = None
@@ -295,12 +322,15 @@ class Sampler:
         if not self.a.no_streams:
             st = read_text(os.path.join(self.a.dbg, "streams"))
             self.streams = parse_streams(st) if st is not None else None
+            rg = read_text(os.path.join(self.a.dbg, "regions"))
+            self.regions = parse_regions(rg) if rg is not None else None
         wb = read_text(os.path.join(self.a.dbg, "wb_hist"))
         self.wb = parse_wb_hist(wb) if wb is not None else []
 
         for n in ("samon_act_p1", "samon_act_p2", "samon_act_p3", "samon_act_p4",
                   "samon_opt_b", "samon_q_len", "samon_seq_min", "samon_dbg_lba",
-                  "samon_dev_major", "samon_dev_minor"):
+                  "samon_dev_major", "samon_dev_minor", "samon_classifier",
+                  "samon_rgn_hot_pct", "samon_rgn_seq_kb"):
             self.params[n] = self._param(n)
         kd0 = os.path.join(self.a.kd, "0")
         self.kd = {
@@ -461,6 +491,59 @@ def render_streams(s: Sampler, hz: int, rows: int) -> Panel:
     return Panel(t, title="Stream_Table (최근 갱신 순)", subtitle=cap, padding=(0, 1))
 
 
+# 플래그 → 짧은 표시(패턴 번호). loop인 region은 scan 플래그도 갖지만 큰 read는 P3로 판정되므로 P3만 보인다.
+REGION_FLAG_TEXT = (("L", "P3", "bold magenta"), ("S", "P1", "bold cyan"),
+                    ("H", "P2", "bold green"), ("W", "P4", "bold yellow"),
+                    ("w", "P5", "bold red"))
+
+
+def sz_txt(sectors: int) -> str:
+    """sector 수를 짧게: 1GiB 미만은 M, 이상은 G."""
+    m = mib(sectors)
+    return f"{m:.0f}M" if m < 1024 else f"{m / 1024:.1f}G"
+
+
+def region_mode(s: Sampler) -> bool:
+    """패턴을 Region_Classifier가 판정하는가(samon_classifier=1). 파라미터가 없으면 예전 커널."""
+    return (s.params.get("samon_classifier") or "0") == "1"
+
+
+def render_regions(s: Sampler, rows: int) -> Panel:
+    """마지막 집계 주기의 DAMON region(sector 범위)과 nr_accesses, I/O 크기 구분 수, 라벨.
+    라벨이 붙은 region을 먼저, 그다음 nr_accesses가 큰 순서로 보인다."""
+    title = "DAMON region 판정"
+    if s.regions is None:
+        return Panel(Text("regions 파일 없음 (예전 커널)", style="grey50"), title=title)
+    head, regs = s.regions
+    if not regs:
+        msg = ("region 없음: kdamond가 꺼져 있거나 target region이 비어 있다 "
+               "(targets/0/regions/nr_regions = 0)")
+        return Panel(Text(msg, style="bold yellow"), title=title)
+    t = Table(expand=True, box=None, pad_edge=False)
+    for c, j in (("시작", "right"), ("크기", "right"), ("acc", "right"),
+                 ("r큰/작", "right"), ("w큰/작", "right"), ("판정", "left")):
+        t.add_column(c, justify=j, no_wrap=True)
+    def key(r: dict) -> tuple[int, int]:
+        return (0 if r["flags"] != "-" else 1, -r["acc"])
+    max_acc = head.get("max_acc") or 0
+    for r in sorted(regs, key=key)[:rows]:
+        lab = Text()
+        for ch, txt, sty in REGION_FLAG_TEXT:
+            if ch in r["flags"] and not (ch == "S" and "L" in r["flags"]):
+                if lab.plain:
+                    lab.append(" ")
+                lab.append(txt, style=sty)
+        if not lab.plain:
+            lab = Text("—", style="grey50")
+        acc = str(r["acc"])
+        t.add_row(sz_txt(r["start"]), sz_txt(r["end"] - r["start"]), acc,
+                  f"{r['rd_big']}/{r['rd_small']}", f"{r['wr_big']}/{r['wr_small']}", lab)
+    nlab = sum(1 for r in regs if r["flags"] != "-")
+    sub = (f"region {head.get('nr', len(regs))}, 라벨 {nlab}, acc 최대 {max_acc}, "
+           f"hot≥{s.params.get('samon_rgn_hot_pct') or '-'}% 큰≥{s.params.get('samon_rgn_seq_kb') or '-'}K")
+    return Panel(t, title=title, subtitle=sub, padding=(0, 1))
+
+
 def render_entry(s: Sampler) -> Panel:
     t = Table(expand=True, box=None, pad_edge=False)
     t.add_column("", no_wrap=True)
@@ -532,15 +615,19 @@ def render(s: Sampler, args: argparse.Namespace, hz: int) -> Layout:
     # 고정 높이: 패턴 6행 + 머리 + 빈 줄 + 분포 막대 + 테두리 = 11, 관측 표 8행 + 머리 + ctx + 테두리 = 12
     lay = Layout()
     lay.split_column(Layout(render_head(s), name="head", size=4), Layout(name="body"))
-    lay["body"].split_row(Layout(name="left", ratio=3), Layout(name="right", ratio=2))
+    # region 판정 표는 열이 많아 오른쪽을 조금 넓힌다
+    lay["body"].split_row(Layout(name="left", ratio=3),
+                          Layout(name="right", ratio=3 if region_mode(s) else 2))
     parts = [Layout(render_patterns(s, args.hist), name="pat", size=11),
              Layout(render_queue(s), name="queue", ratio=1)]
     if s.cg_names:   # 머리 + cgroup 행 + 테두리
         parts.append(Layout(render_lru(s), name="lru", size=3 + len(s.cg_names)))
     parts.append(Layout(render_wb(s, 60), name="wb", size=3))
     lay["left"].split_column(*parts)
-    lay["right"].split_column(Layout(render_streams(s, hz, args.rows), name="streams", ratio=1),
-                              Layout(render_entry(s), name="entry", size=12))
+    # 판정 방식에 맞는 표: region 판정이면 DAMON region, 요청 단위 판정이면 Stream_Table
+    pat = (Layout(render_regions(s, args.rows), name="regions", ratio=1) if region_mode(s)
+           else Layout(render_streams(s, hz, args.rows), name="streams", ratio=1))
+    lay["right"].split_column(pat, Layout(render_entry(s), name="entry", size=12))
     return lay
 
 

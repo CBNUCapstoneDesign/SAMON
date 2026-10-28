@@ -14,6 +14,17 @@
  * Direct I/O is excluded per segment (anon / no mapping / DMA-pinned
  * folio), and every skip reason is counted in /sys/kernel/debug/samon/stats.
  *
+ * Pattern source (samon_classifier, default 1 = Region_Classifier): the
+ * patterns P1..P5 are decided from the DAMON adaptive regions of this
+ * context, i.e. the monitoring result that the region heat map shows
+ * (region ranges, nr_accesses per aggregation interval, and the per-region
+ * read/write request and sector counts of the same region counter path).
+ * kdamond labels every region once per aggregation interval
+ * (ops.reset_aggregated) and the completion probe applies the label of the
+ * region a request falls in to the folios of that request.  Setting
+ * samon_classifier = 0 restores the previous per-request detectors
+ * (Stream_Table, Loop_History, Reread_Table, SAMON_Map) for comparison.
+ *
  * Author: Sangsoo Park, Sumin Sim
  */
 
@@ -32,6 +43,8 @@
 #include <linux/jiffies.h>
 #include <linux/mm.h>        /* folio_maybe_dma_pinned */
 #include <linux/percpu.h>    /* DEFINE_PER_CPU, this_cpu_inc/dec */
+#include <linux/memcontrol.h> /* folio_memcg_rcu, memory.max (P3 cap) */
+#include <linux/rcupdate.h>
 #include <linux/preempt.h>   /* in_hardirq, in_serving_softirq */
 #include <linux/hash.h>      /* hash_64 */
 #include <linux/math.h>      /* reciprocal_scale */
@@ -154,6 +167,18 @@ static const struct kernel_param_ops samon_uint_pct_ops = {
 	.get = param_get_uint,
 };
 
+/* 0..2 only */
+static int samon_param_set_uint_02(const char *val,
+				   const struct kernel_param *kp)
+{
+	return param_set_uint_minmax(val, kp, 0, 2);
+}
+
+static const struct kernel_param_ops samon_uint_02_ops = {
+	.set = samon_param_set_uint_02,
+	.get = param_get_uint,
+};
+
 /* Read once at kdamond start (damon_sa_init); a later write applies to the
  * next start.  Per-CPU ring and drain array both have this many slots. */
 static unsigned int samon_q_len = SAMON_DEF_Q_LEN;
@@ -213,6 +238,111 @@ static unsigned int samon_loop_protect_pct = SAMON_DEF_LOOP_PROTECT_PCT;
 module_param_cb(samon_loop_protect_pct, &samon_uint_pct_ops, &samon_loop_protect_pct, 0644);
 MODULE_PARM_DESC(samon_loop_protect_pct,
 	"P3: first this percent of the loop range is promoted, the rest demoted; 0..100");
+
+/*
+ * P3 protection cap (opt A, 2026-10-28 screening).  The protected front of
+ * a loop is the first samon_loop_protect_pct of L, independent of memory.
+ * When L x pct exceeds the memory limit (mixed 512M: a 2G scan file gives a
+ * 1G protected front), the promoted folios push the rest of the cgroup out.
+ * A segment at distance d from the slot start is promoted only if it is in
+ * the pct front AND d is below the cap; otherwise it is demoted.
+ *   samon_loop_protect_max_kb  : absolute cap in KiB; 0 = no cap (default)
+ *   samon_loop_protect_mem_pct : cap = this percent of memory.max of the
+ *                                memcg of the request's first folio;
+ *                                0 = off (default); ignored for the root
+ *                                memcg and for an unlimited memory.max
+ * The tighter cap applies.  Computed once per P3 request (probe context,
+ * RCU read side, no lock).  Only the folio's own memcg is checked, not its
+ * ancestors.
+ */
+static unsigned int samon_loop_protect_max_kb;
+module_param(samon_loop_protect_max_kb, uint, 0644);
+MODULE_PARM_DESC(samon_loop_protect_max_kb,
+	"P3: cap of the promoted loop front in KiB, 0 = no cap (default)");
+
+static unsigned int samon_loop_protect_mem_pct;
+module_param_cb(samon_loop_protect_mem_pct, &samon_uint_pct_ops, &samon_loop_protect_mem_pct, 0644);
+MODULE_PARM_DESC(samon_loop_protect_mem_pct,
+	"P3: cap of the promoted loop front as percent of the folio memcg memory.max, 0 = off (default); 0..100");
+
+/*
+ * P2 action (opt B).  1 = folio_activate (default, unchanged); 2 =
+ * folio_mark_accessed (on MGLRU only folio_inc_refs, which leaves the
+ * refault tier decision to MGLRU); 0 = detect only (det_p2 counts, nothing
+ * is queued).
+ */
+static unsigned int samon_p2_mode = 1;
+module_param_cb(samon_p2_mode, &samon_uint_02_ops, &samon_p2_mode, 0644);
+MODULE_PARM_DESC(samon_p2_mode,
+	"P2 action: 1 = folio_activate (default), 2 = folio_mark_accessed, 0 = detect only; 0..2");
+
+/*
+ * Reread_Table lookup while P2 has no action (opt C: completion cost).
+ * samon_reread_hit() takes the global samon_pat_lock once per read segment
+ * that is neither P1 nor P3.  1 = always look up (default, det_p2 stays
+ * comparable across configs); 0 = skip the lookup when samon_act_p2 == 0
+ * or samon_p2_mode == 0, so such reads become P6 and det_p2 stays 0.
+ */
+static unsigned int samon_p2_detect_when_off = 1;
+module_param_cb(samon_p2_detect_when_off, &samon_uint_01_ops, &samon_p2_detect_when_off, 0644);
+MODULE_PARM_DESC(samon_p2_detect_when_off,
+	"1 = look up Reread_Table even when P2 has no action (default), 0 = skip it; 0 or 1");
+
+/*
+ * Region_Classifier (2026-10-28).  Per region and aggregation interval the
+ * region counter path counts completed requests by direction and by size
+ * class (large = at least samon_rgn_seq_kb, i.e. readahead/writeback sized
+ * sequential I/O; small = the rest), and acc = samples with any I/O (the
+ * value DAMON uses as nr_accesses; max_acc = aggr_interval / sample_interval).
+ * A region gets every flag whose rule holds:
+ *   scan  : large reads >= min_ios
+ *   loop  : scan, and the same sectors were scanned more than loop_gap and at
+ *           most hold intervals ago (history inherited from the previous
+ *           interval's region with the largest overlap), or the region was
+ *           already a loop in the previous interval and is still scanned
+ *   hot_r : small reads >= min_ios and acc >= hot_pct % of max_acc
+ *   seqw  : large writes >= min_ios
+ *   hot_w : small writes >= min_ios and acc >= hot_pct % of max_acc
+ * Size classes are kept apart because DAMON merges neighbouring regions with
+ * similar nr_accesses, so a hot file and a scanned file next to each other
+ * on disk can end up in one region.  Pattern of a segment, from the flags of
+ * its request's region and the request's own size class and direction:
+ *   large read : loop -> P3, scan -> P1;   small read  : hot_r -> P2;
+ *   large write: seqw -> P4;               small write : hot_w -> P5;
+ *   anything else -> P6.
+ * P3 promotes the first samon_loop_protect_pct of the loop span (contiguous
+ * regions scanned within the last hold intervals) and demotes the rest,
+ * with the caps of samon_loop_protect_max_kb / samon_loop_protect_mem_pct.
+ */
+static unsigned int samon_classifier = 1;
+module_param_cb(samon_classifier, &samon_uint_01_ops, &samon_classifier, 0644);
+MODULE_PARM_DESC(samon_classifier,
+	"Pattern source: 1 = DAMON adaptive regions (Region_Classifier, default), 0 = per-request detectors (Stream_Table, Reread_Table, SAMON_Map); 0 or 1");
+
+static unsigned int samon_rgn_seq_kb = 64;
+module_param(samon_rgn_seq_kb, uint, 0644);
+MODULE_PARM_DESC(samon_rgn_seq_kb,
+	"Region_Classifier: average request size (KiB) from which a region's reads/writes count as sequential (default 64)");
+
+static unsigned int samon_rgn_min_ios = 4;
+module_param(samon_rgn_min_ios, uint, 0644);
+MODULE_PARM_DESC(samon_rgn_min_ios,
+	"Region_Classifier: minimum requests of one direction in an aggregation interval to label a region (default 4)");
+
+static unsigned int samon_rgn_hot_pct = 50;
+module_param_cb(samon_rgn_hot_pct, &samon_uint_pct_ops, &samon_rgn_hot_pct, 0644);
+MODULE_PARM_DESC(samon_rgn_hot_pct,
+	"Region_Classifier: nr_accesses in percent of the maximum from which a small-I/O region is hot (default 50); 0..100");
+
+static unsigned int samon_rgn_loop_gap = 3;
+module_param(samon_rgn_loop_gap, uint, 0644);
+MODULE_PARM_DESC(samon_rgn_loop_gap,
+	"Region_Classifier: aggregation intervals without scanning before a rescan counts as a loop (default 3)");
+
+static unsigned int samon_rgn_hold = 100;
+module_param_cb(samon_rgn_hold, &samon_uint_min1_ops, &samon_rgn_hold, 0644);
+MODULE_PARM_DESC(samon_rgn_hold,
+	"Region_Classifier: aggregation intervals a scanned range is remembered for loop detection (default 100); >= 1");
 
 /* Immediately applied (read with READ_ONCE where used), no range check
  * (design K9). */
@@ -356,6 +486,7 @@ struct samon_flow {
 	u8		 kind;		/* enum samon_flow_kind              */
 	sector_t	 start;		/* P3: slot start at decision time   */
 	sector_t	 loop_len;	/* P3: L, sectors                    */
+	sector_t	 protect_cap;	/* P3: cap on d, sectors, 0 = none   */
 };
 
 /* ------------------------------------------------------------------ */
@@ -363,13 +494,65 @@ struct samon_flow {
 /* ------------------------------------------------------------------ */
 
 struct damon_sa_ctx {
-	/* Legacy per-region I/O counters (binary access detection) */
+	/* Per-region I/O counters (binary access detection per sample) */
 	atomic_t	 io_counts[DAMON_SA_MAX_REGIONS];
 	unsigned int	 nr_regions;
 	unsigned long	 region_starts[DAMON_SA_MAX_REGIONS];
 	unsigned long	 region_ends[DAMON_SA_MAX_REGIONS];
 	bool		 active;
+	/*
+	 * Region_Classifier input, accumulated over one aggregation interval
+	 * for the region set of that interval (index = position in the arrays
+	 * above).  The request and sector counters are added by the probe (lockless,
+	 * a stale index during a map rebuild can only misattribute one
+	 * request); acc[] is written by kdamond only (check_accesses).  All are
+	 * zeroed at the first map update after a classification (agg_reset).
+	 */
+	atomic_t	 rd_big[DAMON_SA_MAX_REGIONS];	/* large reads   */
+	atomic_t	 rd_small[DAMON_SA_MAX_REGIONS];	/* small reads   */
+	atomic_t	 wr_big[DAMON_SA_MAX_REGIONS];	/* large writes  */
+	atomic_t	 wr_small[DAMON_SA_MAX_REGIONS];	/* small writes  */
+	atomic_t	 rd_sec[DAMON_SA_MAX_REGIONS];	/* read sectors  */
+	atomic_t	 wr_sec[DAMON_SA_MAX_REGIONS];	/* write sectors */
+	u16		 acc[DAMON_SA_MAX_REGIONS];
+	bool		 agg_reset;
 };
+
+/* Region label flags (Region_Classifier); index k is bit (1 << k) */
+enum samon_rkind { SAMON_RK_SCAN, SAMON_RK_LOOP, SAMON_RK_HOTR, SAMON_RK_SEQW,
+		   SAMON_RK_HOTW, SAMON_NR_RK };
+#define SAMON_RF(k)	(1U << (k))
+
+struct samon_rlabel {
+	sector_t	 start, end;		/* region [start, end), sectors  */
+	sector_t	 span_start;		/* LOOP: start of the loop span   */
+	sector_t	 span_len;		/* LOOP: length of the span       */
+	unsigned long	 last_scan;		/* interval id of last scan, 0 = none */
+	u32		 rd_big, rd_small, wr_big, wr_small;	/* interval features */
+	u32		 rd_sec, wr_sec;
+	u16		 acc;			/* samples with I/O (nr_accesses) */
+	u8		 flags;			/* SAMON_RF(enum samon_rkind)     */
+};
+
+/*
+ * Label map published by kdamond once per aggregation interval and read by
+ * the probe under RCU.  The old map is freed with kvfree_rcu(); kdamond is
+ * the only writer (classification and cleanup both run in its thread).
+ */
+struct samon_rmap {
+	struct rcu_head	 rcu;
+	unsigned long	 iv;			/* interval id                    */
+	unsigned int	 n;
+	unsigned int	 max_acc;
+	struct samon_rlabel e[];
+};
+
+static struct samon_rmap __rcu *samon_rmap;
+static unsigned long samon_rgn_iv;		/* kdamond only                   */
+static unsigned int samon_st_rgn_nr;		/* regions in the current map     */
+static atomic64_t samon_st_rgn_runs;		/* classifications                */
+static atomic64_t samon_st_rgn_nomem;		/* map allocation failures        */
+static atomic64_t samon_st_rgn_lab[SAMON_NR_RK];	/* region-intervals per label */
 
 static struct damon_sa_ctx sa_ctx;
 static DEFINE_MUTEX(sa_ctx_lock);
@@ -448,6 +631,7 @@ static struct samon_wb_bucket samon_wb[SAMON_WB_BUCKETS];
 /* LRU operations that samon_apply() refused because it was reached from
  * the probe or a non-task context.  Unreachable by design: stays 0. */
 static atomic64_t samon_st_direct_ops;
+static atomic64_t samon_st_p3_capped;	/* P3 segments demoted by the cap (opt A) */
 
 /* Observation statistics: lockless, only for verification/debugging */
 static atomic64_t samon_st_rq_seen;	/* requests that passed (1)-(3)    */
@@ -531,7 +715,7 @@ static struct samon_lba_entry *samon_lba_get_or_insert(sector_t lba,
 
 	rb_link_node(&entry->node, parent, link);
 	rb_insert_color(&entry->node, &samon_lba_tree);
-	samon_nr_entries++;
+	WRITE_ONCE(samon_nr_entries, samon_nr_entries + 1);
 
 	return entry;
 }
@@ -550,7 +734,7 @@ static void samon_lba_tree_free(void)
 		rb_erase(&e->node, &samon_lba_tree);
 		kfree(e);
 	}
-	samon_nr_entries = 0;
+	WRITE_ONCE(samon_nr_entries, 0);
 	spin_unlock_irqrestore(&samon_lba_lock, flags);
 }
 
@@ -664,6 +848,16 @@ static struct samon_map_res samon_map_update(sector_t lba, struct page *pg,
 	unsigned long window_jiffies = msecs_to_jiffies(samon_window_ms);
 	unsigned long flags;
 
+	/*
+	 * Fast path (opt C): with no insertion allowed and an empty tree the
+	 * lookup cannot find anything, so skip the global lock.  This is the
+	 * harness case (samon_dbg_lba = 0, tree freed at kdamond stop).  The
+	 * lockless read can only race with an insertion enabled at the same
+	 * moment by a samon_dbg_lba write, which then misses one segment.
+	 */
+	if (!may_insert && !READ_ONCE(samon_nr_entries))
+		return res;
+
 	spin_lock_irqsave(&samon_lba_lock, flags);
 
 	entry = samon_lba_get_or_insert(lba, may_insert);
@@ -721,7 +915,7 @@ static bool samon_toggle(enum samon_pat p)
  *     the folio cannot be freed under us), item stored, inflight++.
  * The probe never calls folio_put() or any LRU function.
  */
-static void samon_enqueue(struct folio *folio, enum samon_act act,
+static void __maybe_unused samon_enqueue(struct folio *folio, enum samon_act act,
 			  enum samon_pat pat)
 {
 	struct samon_cpuq *q = this_cpu_ptr(samon_q);
@@ -739,6 +933,53 @@ static void samon_enqueue(struct folio *folio, enum samon_act act,
 			.t_req = jiffies,
 			.act   = act,
 			.pat   = pat,
+		};
+		q->acct.inflight++;
+	}
+	spin_unlock_irqrestore(&q->lock, flags);
+}
+
+/*
+ * Per-request batch of queue requests (opt C).  samon_handle_rq() collects
+ * up to SAMON_PEND_MAX items and queues them with one q->lock round trip
+ * instead of one per segment.  Accounting is the same as samon_enqueue()
+ * item by item (req first, drop_queue when the ring is full).  The folios
+ * belong to the request being completed and the page cache holds a
+ * reference to each, so they stay valid until the flush in the same probe
+ * call.
+ */
+#define SAMON_PEND_MAX	16
+
+struct samon_pend {
+	struct folio	*folio;
+	u8		 act;
+	u8		 pat;
+};
+
+static void samon_enqueue_batch(const struct samon_pend *p, u32 n)
+{
+	struct samon_cpuq *q;
+	unsigned long flags, now = jiffies;
+	u32 i;
+
+	if (!n)
+		return;
+	q = this_cpu_ptr(samon_q);
+	spin_lock_irqsave(&q->lock, flags);
+	for (i = 0; i < n; i++) {
+		int k = p[i].pat - 1;
+
+		q->acct.req[k]++;
+		if (q->count >= samon_q_cap) {
+			q->acct.drop[SAMON_DROP_QUEUE][k]++;
+			continue;
+		}
+		folio_get(p[i].folio);
+		q->ring[q->count++] = (struct samon_qitem){
+			.folio = p[i].folio,
+			.t_req = now,
+			.act   = p[i].act,
+			.pat   = p[i].pat,
 		};
 		q->acct.inflight++;
 	}
@@ -1018,6 +1259,142 @@ static bool samon_reread_hit(dev_t devt, u64 lba4k)
 }
 
 /*
+ * P3 protection cap in sectors for the request whose first passing folio is
+ * @folio (opt A).  0 = no cap.  See samon_loop_protect_max_kb.
+ */
+static sector_t samon_loop_cap(struct folio *folio)
+{
+	unsigned int kb = READ_ONCE(samon_loop_protect_max_kb);
+	unsigned int mp = READ_ONCE(samon_loop_protect_mem_pct);
+	sector_t cap = (sector_t)kb << 1;	/* KiB -> 512 B sectors */
+
+#ifdef CONFIG_MEMCG
+	if (mp && !mem_cgroup_disabled()) {
+		struct mem_cgroup *memcg;
+		unsigned long max = 0;
+
+		rcu_read_lock();
+		memcg = folio_memcg_rcu(folio);
+		if (memcg && !mem_cgroup_is_root(memcg))
+			max = READ_ONCE(memcg->memory.max);
+		rcu_read_unlock();
+		if (max && max != PAGE_COUNTER_MAX) {
+			sector_t m = (sector_t)(max / 100 * mp) <<
+				     (PAGE_SHIFT - SECTOR_SHIFT);
+
+			if (!cap || m < cap)
+				cap = m;
+		}
+	}
+#endif
+	return cap;
+}
+
+/* Is P2 configured to do anything (toggle on and samon_p2_mode != 0)? */
+static bool samon_p2_active(void)
+{
+	return READ_ONCE(samon_act[1]) && READ_ONCE(samon_p2_mode);
+}
+
+/* P2 action for samon_p2_mode (opt B). */
+static enum samon_act samon_p2_act(void)
+{
+	switch (READ_ONCE(samon_p2_mode)) {
+	case 0:
+		return SAMON_ACT_NONE;
+	case 2:
+		return SAMON_ACT_MARK;
+	default:
+		return SAMON_ACT_PROMOTE;
+	}
+}
+
+/*
+ * Label of the region that contains sector @s in the current label map.
+ * Probe context: RCU read side only, no lock.  Returns false when no map
+ * is published or @s is outside every region.
+ */
+static bool samon_rlabel_lookup(sector_t s, struct samon_rlabel *out)
+{
+	struct samon_rmap *m;
+	bool found = false;
+	int lo, hi, mid;
+
+	rcu_read_lock();
+	m = rcu_dereference(samon_rmap);
+	if (m && m->n) {
+		lo = 0;
+		hi = m->n - 1;
+		while (lo <= hi) {
+			mid = (lo + hi) / 2;
+			if (s < m->e[mid].start) {
+				hi = mid - 1;
+			} else if (s >= m->e[mid].end) {
+				lo = mid + 1;
+			} else {
+				*out = m->e[mid];
+				found = true;
+				break;
+			}
+		}
+	}
+	rcu_read_unlock();
+	return found;
+}
+
+/*
+ * Region_Classifier decision for one segment (samon_classifier = 1).  @l is
+ * the label of the request's region (NULL if none), @big the request's size
+ * class (at least samon_rgn_seq_kb), @cap the P3 cap in
+ * sectors from samon_loop_cap().  Same pattern numbers and actions as
+ * samon_classify_seg(), see the Region_Classifier comment at the tunables.
+ */
+static enum samon_pat samon_classify_rgn(int dir, bool big,
+					 const struct samon_rlabel *l,
+					 sector_t lba, sector_t cap,
+					 enum samon_act *act)
+{
+	unsigned int f = l ? l->flags : 0;
+
+	*act = SAMON_ACT_NONE;
+	if (dir == READ && big) {
+		if (f & SAMON_RF(SAMON_RK_LOOP)) {
+			u64 d = lba > l->span_start ? lba - l->span_start : 0;
+			bool prot = 100 * d < (u64)l->span_len *
+				    READ_ONCE(samon_loop_protect_pct);
+
+			if (prot && cap && d >= cap) {
+				prot = false;		/* opt A: cap */
+				atomic64_inc(&samon_st_p3_capped);
+			}
+			*act = prot ? SAMON_ACT_PROMOTE : SAMON_ACT_DEMOTE;
+			return SAMON_P3;
+		}
+		if (f & SAMON_RF(SAMON_RK_SCAN)) {
+			*act = SAMON_ACT_DEMOTE;
+			return SAMON_P1;
+		}
+		return SAMON_P6;
+	}
+	if (dir == READ) {
+		if (f & SAMON_RF(SAMON_RK_HOTR)) {
+			*act = samon_p2_act();
+			return SAMON_P2;
+		}
+		return SAMON_P6;
+	}
+	if (big && (f & SAMON_RF(SAMON_RK_SEQW))) {
+		*act = SAMON_ACT_DEMOTE;
+		return SAMON_P4;
+	}
+	if (!big && (f & SAMON_RF(SAMON_RK_HOTW))) {
+		*act = SAMON_ACT_MARK;
+		return SAMON_P5;
+	}
+	return SAMON_P6;
+}
+
+/*
  * Per-segment decision: exactly one pattern per segment, priority
  * P3 > P1 > P2 > P4 > P5 > P6 (R8.2).  *act is the action to queue for the
  * pattern (NONE for P6).
@@ -1044,18 +1421,25 @@ static enum samon_pat samon_classify_seg(int dir, dev_t devt, sector_t lba,
 	if (dir == READ) {
 		if (f->kind == SAMON_FLOW_P3) {
 			u64 d = lba > f->start ? lba - f->start : 0;
+			bool prot = 100 * d < (u64)f->loop_len *
+				    READ_ONCE(samon_loop_protect_pct);
 
-			*act = (100 * d < (u64)f->loop_len *
-				READ_ONCE(samon_loop_protect_pct))
-				? SAMON_ACT_PROMOTE : SAMON_ACT_DEMOTE;
+			if (prot && f->protect_cap && d >= f->protect_cap) {
+				prot = false;		/* opt A: cap */
+				atomic64_inc(&samon_st_p3_capped);
+			}
+			*act = prot ? SAMON_ACT_PROMOTE : SAMON_ACT_DEMOTE;
 			return SAMON_P3;
 		}
 		if (f->kind == SAMON_FLOW_P1) {
 			*act = SAMON_ACT_DEMOTE;
 			return SAMON_P1;
 		}
+		/* opt C: skip the locked lookup when P2 would do nothing */
+		if (!READ_ONCE(samon_p2_detect_when_off) && !samon_p2_active())
+			return SAMON_P6;
 		if (samon_reread_hit(devt, lba >> 3)) {
-			*act = SAMON_ACT_PROMOTE;
+			*act = samon_p2_act();		/* opt B */
 			return SAMON_P2;
 		}
 		return SAMON_P6;
@@ -1127,7 +1511,17 @@ static void samon_wb_reset(void)
 static void samon_handle_rq(struct request *rq, int dir, dev_t devt,
 			    unsigned int nr_bytes)
 {
-	struct samon_flow flow = { .kind = SAMON_FLOW_UNSET };
+	struct samon_flow flow = { .kind = SAMON_FLOW_UNSET, .protect_cap = 0 };
+	bool rgn = READ_ONCE(samon_classifier) != 0;
+	bool rgn_done = false, have_lbl = false;
+	bool big = (u64)nr_bytes >= ((u64)READ_ONCE(samon_rgn_seq_kb) << 10);
+	struct samon_rlabel lbl;
+	sector_t rgn_cap = 0;
+	struct samon_pend pend[SAMON_PEND_MAX];
+	u32 np = 0;			/* pending queue requests (opt C)      */
+	u32 nseg = 0;			/* seg_buffered, added once per request */
+	u32 ndet[6] = { 0 };		/* det_pN, added once per request      */
+	int k;
 	sector_t rq_start = blk_rq_pos(rq);		/* start of the not yet completed part */
 	sector_t rq_nsec = nr_bytes >> SECTOR_SHIFT;	/* sectors completed now */
 	unsigned int budget = nr_bytes;
@@ -1159,31 +1553,63 @@ static void samon_handle_rq(struct request *rq, int dir, dev_t devt,
 				goto next_seg;
 
 			/* once per request, at the first passing segment */
-			if (devt && READ_ONCE(samon_ready) &&
-			    flow.kind == SAMON_FLOW_UNSET)
+			if (rgn) {
+				/* once per request: label of its region */
+				if (devt && READ_ONCE(samon_ready) && !rgn_done) {
+					rgn_done = true;
+					have_lbl = samon_rlabel_lookup(rq_start, &lbl);
+					if (have_lbl && dir == READ && big &&
+					    (lbl.flags & SAMON_RF(SAMON_RK_LOOP)))
+						rgn_cap = samon_loop_cap(folio);
+				}
+			} else if (devt && READ_ONCE(samon_ready) &&
+				   flow.kind == SAMON_FLOW_UNSET) {
 				samon_stream_update(dir, devt, rq_start,
 						    rq_nsec, &flow);
+				if (flow.kind == SAMON_FLOW_P3)
+					flow.protect_cap = samon_loop_cap(folio);
+			}
 
 			m = samon_map_update(lba, bv.bv_page, dir,
 					     READ_ONCE(samon_dbg_lba) != 0);
-			atomic64_inc(&samon_st_seg_buffered);
+			nseg++;
 
 			if (!devt || !READ_ONCE(samon_ready))
 				goto next_seg;
 
-			pat = samon_classify_seg(dir, devt, lba, &flow, &m, &act);
-			atomic64_inc(&samon_st_det[pat - 1]);
+			if (rgn)
+				pat = samon_classify_rgn(dir, big,
+							 have_lbl ? &lbl : NULL,
+							 lba, rgn_cap, &act);
+			else
+				pat = samon_classify_seg(dir, devt, lba, &flow,
+							 &m, &act);
+			ndet[pat - 1]++;
 			if (dir == WRITE)
 				nw++;
 
-			if (pat != SAMON_P6 && samon_toggle(pat))
-				samon_enqueue(folio, act, pat);
+			if (pat != SAMON_P6 && act != SAMON_ACT_NONE &&
+			    samon_toggle(pat)) {
+				pend[np++] = (struct samon_pend){
+					.folio = folio, .act = act, .pat = pat,
+				};
+				if (np == SAMON_PEND_MAX) {
+					samon_enqueue_batch(pend, np);
+					np = 0;
+				}
+			}
 next_seg:
 			lba += bv.bv_len >> SECTOR_SHIFT;
 		}
 	}
 done:
 	/* once per request, after the segment walk and outside any lock (K2) */
+	samon_enqueue_batch(pend, np);
+	if (nseg)
+		atomic64_add(nseg, &samon_st_seg_buffered);
+	for (k = 0; k < 6; k++)
+		if (ndet[k])
+			atomic64_add(ndet[k], &samon_st_det[k]);
 	if (nw)
 		samon_wb_add(nw);
 }
@@ -1198,11 +1624,13 @@ done:
  * once here, clamped to the array size, so a concurrent update can at
  * worst yield a stale region lookup but never an out-of-bounds index.
  */
-static void samon_legacy_region_count(struct request *rq)
+static void samon_legacy_region_count(struct request *rq, unsigned int nr_bytes)
 {
 	unsigned long sector;
 	int lo, hi, mid;
 	unsigned int nr;
+	enum req_op op = req_op(rq);
+	bool big = (u64)nr_bytes >= ((u64)READ_ONCE(samon_rgn_seq_kb) << 10);
 
 	nr = min_t(unsigned int, READ_ONCE(sa_ctx.nr_regions),
 		   DAMON_SA_MAX_REGIONS);
@@ -1220,6 +1648,18 @@ static void samon_legacy_region_count(struct request *rq)
 			lo = mid + 1;
 		else {
 			atomic_inc(&sa_ctx.io_counts[mid]);
+			/* Region_Classifier input: direction, size */
+			if (op == REQ_OP_READ) {
+				atomic_inc(big ? &sa_ctx.rd_big[mid] :
+					   &sa_ctx.rd_small[mid]);
+				atomic_add(nr_bytes >> SECTOR_SHIFT,
+					   &sa_ctx.rd_sec[mid]);
+			} else if (op == REQ_OP_WRITE) {
+				atomic_inc(big ? &sa_ctx.wr_big[mid] :
+					   &sa_ctx.wr_small[mid]);
+				atomic_add(nr_bytes >> SECTOR_SHIFT,
+					   &sa_ctx.wr_sec[mid]);
+			}
 			break;
 		}
 	}
@@ -1267,7 +1707,7 @@ static void damon_sa_bio_trace(void *data, struct request *rq,
 	else
 		atomic64_inc(&samon_st_ctx_task);
 
-	samon_legacy_region_count(rq);
+	samon_legacy_region_count(rq, nr_bytes);
 
 	if (nr_bytes < blk_rq_bytes(rq))
 		atomic64_inc(&samon_st_budget_cut);
@@ -1472,6 +1912,7 @@ static void damon_sa_init(struct damon_ctx *ctx)
 	for (i = 0; i < DAMON_SA_MAX_REGIONS; i++)
 		atomic_set(&sa_ctx.io_counts[i], 0);
 	WRITE_ONCE(sa_ctx.nr_regions, 0);
+	sa_ctx.agg_reset = true;	/* Region_Classifier accumulators */
 
 	/* Only one saddr kdamond owns the probe, queue and tables. */
 	if (samon_owner) {
@@ -1673,6 +2114,20 @@ static void damon_sa_prepare_access_checks(struct damon_ctx *ctx)
 
 	for (i = 0; i < sa_ctx.nr_regions; i++)
 		atomic_set(&sa_ctx.io_counts[i], 0);
+
+	/* new aggregation interval: start the Region_Classifier input over */
+	if (sa_ctx.agg_reset) {
+		for (i = 0; i < DAMON_SA_MAX_REGIONS; i++) {
+			atomic_set(&sa_ctx.rd_big[i], 0);
+			atomic_set(&sa_ctx.rd_small[i], 0);
+			atomic_set(&sa_ctx.wr_big[i], 0);
+			atomic_set(&sa_ctx.wr_small[i], 0);
+			atomic_set(&sa_ctx.rd_sec[i], 0);
+			atomic_set(&sa_ctx.wr_sec[i], 0);
+			sa_ctx.acc[i] = 0;
+		}
+		sa_ctx.agg_reset = false;
+	}
 }
 
 static unsigned int damon_sa_check_accesses(struct damon_ctx *ctx)
@@ -1692,12 +2147,158 @@ static unsigned int damon_sa_check_accesses(struct damon_ctx *ctx)
 			accessed = (atomic_read(&sa_ctx.io_counts[idx]) > 0);
 			damon_update_region_access_rate(r, accessed,
 							&ctx->attrs);
+			if (accessed && sa_ctx.acc[idx] < U16_MAX)
+				sa_ctx.acc[idx]++;	/* Region_Classifier */
 			max_nr_accesses = max(r->nr_accesses, max_nr_accesses);
 			idx++;
 		}
 	}
 
 	return max_nr_accesses;
+}
+
+/*
+ * History of the previous interval for the region [@s, @e): the entry of the
+ * old map with the largest overlap (both maps are sorted and contiguous, so
+ * *@j only moves forward over one classification).  NULL if none overlaps.
+ */
+static const struct samon_rlabel *
+samon_rgn_inherit(const struct samon_rmap *old, unsigned int *j,
+		  sector_t s, sector_t e)
+{
+	const struct samon_rlabel *best = NULL;
+	sector_t best_ov = 0;
+	unsigned int k;
+
+	if (!old)
+		return NULL;
+	while (*j < old->n && old->e[*j].end <= s)
+		(*j)++;
+	for (k = *j; k < old->n && old->e[k].start < e; k++) {
+		sector_t lo = max(s, old->e[k].start);
+		sector_t hi = min(e, old->e[k].end);
+
+		if (hi > lo && hi - lo > best_ov) {
+			best_ov = hi - lo;
+			best = &old->e[k];
+		}
+	}
+	return best;
+}
+
+/*
+ * Region_Classifier: once per aggregation interval (ops.reset_aggregated,
+ * kdamond, process context, after DAMON merged/split the regions).  The
+ * counters still belong to the region set that was in effect during the
+ * interval (sa_ctx arrays, rebuilt at the next prepare_access_checks), so the
+ * labels are computed for that set and published as a new map.  Regions of
+ * the next interval look labels up by sector, so DAMON's merge/split of the
+ * regions does not have to be followed here.
+ */
+static void damon_sa_reset_aggregated(struct damon_ctx *ctx)
+{
+	struct samon_rmap *old, *nm;
+	unsigned int n, i, j = 0, maxacc;
+	unsigned int min_ios = READ_ONCE(samon_rgn_min_ios);
+	unsigned int hot_pct = READ_ONCE(samon_rgn_hot_pct);
+	unsigned long gap = READ_ONCE(samon_rgn_loop_gap);
+	unsigned long hold = READ_ONCE(samon_rgn_hold);
+	u64 nlab[SAMON_NR_RK] = { 0 };
+	unsigned long iv;
+
+	if (ctx != READ_ONCE(samon_owner) || !READ_ONCE(samon_ready))
+		return;
+
+	n = min_t(unsigned int, READ_ONCE(sa_ctx.nr_regions), DAMON_SA_MAX_REGIONS);
+	maxacc = damon_max_nr_accesses(&ctx->attrs);
+	sa_ctx.agg_reset = true;
+	nm = kvzalloc(struct_size(nm, e, n), GFP_KERNEL);
+	if (!nm) {
+		atomic64_inc(&samon_st_rgn_nomem);
+		return;
+	}
+	iv = ++samon_rgn_iv;
+	old = rcu_dereference_protected(samon_rmap, true);
+
+	for (i = 0; i < n; i++) {
+		struct samon_rlabel *e = &nm->e[i];
+		const struct samon_rlabel *h;
+		bool hot = (u64)sa_ctx.acc[i] * 100 >= (u64)hot_pct * maxacc;
+		bool was_loop;
+		unsigned int k;
+
+		e->start = sa_ctx.region_starts[i];
+		e->end = sa_ctx.region_ends[i];
+		e->rd_big = atomic_read(&sa_ctx.rd_big[i]);
+		e->rd_small = atomic_read(&sa_ctx.rd_small[i]);
+		e->wr_big = atomic_read(&sa_ctx.wr_big[i]);
+		e->wr_small = atomic_read(&sa_ctx.wr_small[i]);
+		e->rd_sec = atomic_read(&sa_ctx.rd_sec[i]);
+		e->wr_sec = atomic_read(&sa_ctx.wr_sec[i]);
+		e->acc = sa_ctx.acc[i];
+
+		h = samon_rgn_inherit(old, &j, e->start, e->end);
+		e->last_scan = h ? h->last_scan : 0;
+		was_loop = h && (h->flags & SAMON_RF(SAMON_RK_LOOP));
+
+		if (e->rd_big >= min_ios) {
+			bool rescan = e->last_scan &&
+				      iv - e->last_scan > gap &&
+				      iv - e->last_scan <= hold;
+			bool cont = was_loop && e->last_scan + 1 >= iv;
+
+			e->flags |= SAMON_RF(SAMON_RK_SCAN);
+			if (rescan || cont)
+				e->flags |= SAMON_RF(SAMON_RK_LOOP);
+			e->last_scan = iv;
+		}
+		if (e->rd_small >= min_ios && hot)
+			e->flags |= SAMON_RF(SAMON_RK_HOTR);
+		if (e->wr_big >= min_ios)
+			e->flags |= SAMON_RF(SAMON_RK_SEQW);
+		if (e->wr_small >= min_ios && hot)
+			e->flags |= SAMON_RF(SAMON_RK_HOTW);
+		if (e->last_scan && iv - e->last_scan > hold)
+			e->last_scan = 0;
+		for (k = 0; k < SAMON_NR_RK; k++)
+			if (e->flags & SAMON_RF(k))
+				nlab[k]++;
+	}
+
+	/* loop spans: maximal runs of contiguous regions scanned within hold */
+	i = 0;
+	while (i < n) {
+		unsigned int k = i, t;
+		sector_t s0, len;
+
+		if (!nm->e[i].last_scan) {
+			i++;
+			continue;
+		}
+		while (k + 1 < n && nm->e[k + 1].last_scan &&
+		       nm->e[k + 1].start == nm->e[k].end)
+			k++;
+		s0 = nm->e[i].start;
+		len = nm->e[k].end - s0;
+		for (t = i; t <= k; t++) {
+			nm->e[t].span_start = s0;
+			nm->e[t].span_len = len;
+		}
+		i = k + 1;
+	}
+
+	nm->iv = iv;
+	nm->n = n;
+	nm->max_acc = maxacc;
+	rcu_assign_pointer(samon_rmap, nm);
+	if (old)
+		kvfree_rcu(old, rcu);
+
+	WRITE_ONCE(samon_st_rgn_nr, n);
+	atomic64_inc(&samon_st_rgn_runs);
+	for (i = 0; i < SAMON_NR_RK; i++)
+		if (nlab[i])
+			atomic64_add(nlab[i], &samon_st_rgn_lab[i]);
 }
 
 static void damon_sa_cleanup(struct damon_ctx *ctx)
@@ -1726,6 +2327,17 @@ static void damon_sa_cleanup(struct damon_ctx *ctx)
 	mutex_unlock(&sa_ctx_lock);
 
 	samon_lba_tree_free();
+
+	/* Region_Classifier map: the probe is gone (synchronized above), but a
+	 * debugfs "regions" reader may still hold it under RCU */
+	{
+		struct samon_rmap *om = rcu_replace_pointer(samon_rmap, NULL, true);
+
+		if (om)
+			kvfree_rcu(om, rcu);
+	}
+	WRITE_ONCE(samon_st_rgn_nr, 0);
+	samon_rgn_iv = 0;
 
 	/* SAMON fully stopped: the next saddr kdamond may own it. */
 	mutex_lock(&sa_ctx_lock);
@@ -1824,6 +2436,13 @@ static int samon_stats_show(struct seq_file *m, void *v)
 		[SAMON_DROP_REVALIDATE]	= "revalidate",
 		[SAMON_DROP_TOGGLE]	= "toggle",
 		[SAMON_DROP_SHUTDOWN]	= "shutdown",
+	};
+	static const char * const rk_name[SAMON_NR_RK] = {
+		[SAMON_RK_SCAN]	= "scan",
+		[SAMON_RK_LOOP]	= "loop",
+		[SAMON_RK_HOTR]	= "hot_r",
+		[SAMON_RK_SEQW]	= "seqw",
+		[SAMON_RK_HOTW]	= "hot_w",
 	};
 	static const char * const sev_name[SAMON_NR_SEV] = {
 		[SAMON_SEV_EXTEND]	= "extend",
@@ -1932,6 +2551,17 @@ static int samon_stats_show(struct seq_file *m, void *v)
 				   sev_name[k],
 				   (long long)atomic64_read(&samon_st_stream[r][k]));
 
+	/* 79: opt A */
+	seq_printf(m, "p3_capped=%lld\n",
+		   (long long)atomic64_read(&samon_st_p3_capped));
+	/* 80~88: Region_Classifier (rgn_<flag> = region-intervals with the flag) */
+	seq_printf(m, "classifier=%u\n", READ_ONCE(samon_classifier));
+	seq_printf(m, "rgn_nr=%u\n", READ_ONCE(samon_st_rgn_nr));
+	seq_printf(m, "rgn_runs=%lld\n", (long long)atomic64_read(&samon_st_rgn_runs));
+	seq_printf(m, "rgn_nomem=%lld\n", (long long)atomic64_read(&samon_st_rgn_nomem));
+	for (k = 0; k < SAMON_NR_RK; k++)
+		seq_printf(m, "rgn_%s=%lld\n", rk_name[k],
+			   (long long)atomic64_read(&samon_st_rgn_lab[k]));
 	/* last line keeps its legacy format (verify entries parser) */
 	seq_printf(m, "entries=%u max_entries=%u\n", nr, samon_max_entries);
 	return 0;
@@ -2101,6 +2731,67 @@ static const struct file_operations samon_wb_hist_fops = {
 };
 
 /* ------------------------------------------------------------------ */
+/* debugfs: /sys/kernel/debug/samon/regions (Region_Classifier)        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The current label map: one line per DAMON region of the last classified
+ * aggregation interval with its features (the heat map data) and label.
+ * Read under RCU; seq_printf() does not sleep.
+ */
+static int samon_regions_show(struct seq_file *m, void *v)
+{
+	static const char kc[SAMON_NR_RK] = { 'S', 'L', 'H', 'W', 'w' };
+	struct samon_rmap *rm;
+	unsigned int i;
+
+	rcu_read_lock();
+	rm = rcu_dereference(samon_rmap);
+	if (!rm) {
+		seq_puts(m, "# no map (kdamond off, or no target region set)\n");
+		goto out;
+	}
+	seq_printf(m, "# iv=%lu nr=%u max_acc=%u classifier=%u\n", rm->iv, rm->n,
+		   rm->max_acc, READ_ONCE(samon_classifier));
+	seq_puts(m, "# flags: S scan, L loop, H hot_r, W seqw, w hot_w, - none\n");
+	seq_puts(m, "# start end acc rd_big rd_small wr_big wr_small rd_kb wr_kb flags last_scan span_start span_len\n");
+	for (i = 0; i < rm->n; i++) {
+		const struct samon_rlabel *e = &rm->e[i];
+		char fl[SAMON_NR_RK + 1];
+		unsigned int k, p = 0;
+
+		for (k = 0; k < SAMON_NR_RK; k++)
+			if (e->flags & SAMON_RF(k))
+				fl[p++] = kc[k];
+		if (!p)
+			fl[p++] = '-';
+		fl[p] = '\0';
+		seq_printf(m, "%llu %llu %u %u %u %u %u %u %u %s %lu %llu %llu\n",
+			   (unsigned long long)e->start, (unsigned long long)e->end,
+			   e->acc, e->rd_big, e->rd_small, e->wr_big, e->wr_small,
+			   e->rd_sec >> 1, e->wr_sec >> 1, fl, e->last_scan,
+			   (unsigned long long)e->span_start,
+			   (unsigned long long)e->span_len);
+	}
+out:
+	rcu_read_unlock();
+	return 0;
+}
+
+static int samon_regions_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, samon_regions_show, NULL);
+}
+
+static const struct file_operations samon_regions_fops = {
+	.owner   = THIS_MODULE,
+	.open    = samon_regions_open,
+	.read    = seq_read,
+	.llseek  = seq_lseek,
+	.release = single_release,
+};
+
+/* ------------------------------------------------------------------ */
 /* Module init / exit                                                  */
 /* ------------------------------------------------------------------ */
 
@@ -2112,7 +2803,7 @@ static int __init damon_sa_initcall(void)
 		.update               = NULL,
 		.prepare_access_checks = damon_sa_prepare_access_checks,
 		.check_accesses       = damon_sa_check_accesses,
-		.reset_aggregated     = NULL,
+		.reset_aggregated     = damon_sa_reset_aggregated,
 		.target_valid         = NULL,
 		.cleanup              = damon_sa_cleanup,
 		.apply_scheme         = NULL,
@@ -2139,9 +2830,12 @@ static int __init damon_sa_initcall(void)
 	if (!IS_ERR_OR_NULL(samon_dbgfs_dir))
 		debugfs_create_file("wb_hist", 0444, samon_dbgfs_dir, NULL,
 				    &samon_wb_hist_fops);
+	if (!IS_ERR_OR_NULL(samon_dbgfs_dir))
+		debugfs_create_file("regions", 0444, samon_dbgfs_dir, NULL,
+				    &samon_regions_fops);
 
-	pr_info("SAMON saddr ops registered (hot_threshold=%u window_ms=%u)\n",
-		samon_hot_threshold, samon_window_ms);
+	pr_info("SAMON saddr ops registered (hot_threshold=%u window_ms=%u classifier=%u)\n",
+		samon_hot_threshold, samon_window_ms, samon_classifier);
 	return 0;
 }
 

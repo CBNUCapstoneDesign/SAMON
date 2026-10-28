@@ -22,7 +22,12 @@ samon_dev_major=0 samon_dev_minor=0 samon_dbg_lba=1
 samon_q_len=8192 samon_q_max_ms=100 samon_stream_slots=16 samon_loop_slots=16
 samon_reread_slots=65536 samon_seq_min=4 samon_stream_new_kb=64 samon_stream_gap_req=2
 samon_stream_idle_ms=1000 samon_loop_min_kb=8192 samon_loop_protect_pct=50
-samon_reread_ms=10000"
+samon_reread_ms=10000 samon_classifier=0"
+# samon_classifier=0: this script checks the per-request detectors (Stream_Table,
+# Loop_History, Reread_Table, SAMON_Map), which need no DAMON target region.  The
+# Region_Classifier (samon_classifier=1, kernel default since 2026-10-28) labels
+# DAMON target regions, which this script does not set; it is checked separately
+# through /sys/kernel/debug/samon/regions.
 
 # kernel messages that count as a warning (R13.5)
 WARN_RE='BUG:|WARNING:|Oops|KASAN|lockdep|RCU stall|soft lockup'
