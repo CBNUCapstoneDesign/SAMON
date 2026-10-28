@@ -390,6 +390,19 @@ kd_off || die "kdamond did not stop"
 [ "$(rd "$KD/0/contexts/nr_contexts")" -ge 1 ] 2>/dev/null || printf '1\n' > "$KD/0/contexts/nr_contexts"
 wr "$KD/0/contexts/0/operations" saddr || die "cannot set operations=saddr"
 [ "$(rd "$KD/0/contexts/0/targets/nr_targets")" -ge 1 ] 2>/dev/null || printf '1\n' > "$KD/0/contexts/0/targets/nr_targets"
+# DAMON target region = 시연 디스크 전체. Region_Classifier(samon_classifier=1)는 이 범위의 adaptive
+# region으로 패턴을 판정하므로, 비어 있으면(nr_regions=0) 패턴이 하나도 감지되지 않는다.
+RG=$KD/0/contexts/0/targets/0/regions
+if [ -d "$RG" ]; then
+	RG_END=$(rd "/sys/class/block/$DISK/size") || RG_END=""
+	if [ -n "$RG_END" ] && [ "$RG_END" -gt 0 ] 2>/dev/null; then
+		wr "$RG/nr_regions" 1 && wr "$RG/0/start" 0 && wr "$RG/0/end" "$RG_END" ||
+			die "cannot set the DAMON target region (0-$RG_END)"
+		say "DAMON target region: 0-$RG_END sectors ($DISK)"
+	else
+		say "WARNING: cannot read /sys/class/block/$DISK/size; DAMON target region not set"
+	fi
+fi
 # 큐는 sample 주기마다 비워진다. 길면 큐가 가득 차 유실(drop_queue)이 생긴다
 wr "$ATTRS/sample_us" "$SAMPLE_US" || die "cannot set sample_us"
 wr "$ATTRS/aggr_us" "$AGGR_US" || die "cannot set aggr_us"

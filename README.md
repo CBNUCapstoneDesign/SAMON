@@ -1,8 +1,8 @@
 # SAMON - Storage Access MONitor
 
-SAMON은 Linux 6.8 DAMON의 operations set "saddr"(mm/damon/saddr.c)로 구현한 커널 내부 스토리지 접근 관측기이다. block layer의 `block_rq_complete` tracepoint에서 완료된 buffered I/O를 LBA 단위로 보고, LBA를 page cache의 folio(PFN)와 연결하며, segment마다 접근 패턴(P1 순차 read, P2 재읽기, P3 loop read, P4 순차 write, P5 hot write, P6 기타)을 판정한다. 판정 결과에 따른 LRU 조작(folio_activate, folio_deactivate, folio_mark_accessed)은 완료 콜백에서 직접 하지 않고 CPU별 큐를 거쳐 kdamond가 프로세스 컨텍스트에서 실행한다. 패턴별 조작 토글(samon_act_p1~p4)의 기본값은 0이다.
+SAMON은 Linux 6.8 DAMON의 operations set "saddr"(mm/damon/saddr.c)로 구현한 커널 내부 스토리지 접근 관측기이다. block layer의 `block_rq_complete` tracepoint에서 완료된 buffered I/O를 LBA 단위로 보고, LBA를 page cache의 folio(PFN)와 연결한다. DAMON이 디스크 섹터 공간을 adaptive region으로 나누고, SAMON은 region별 I/O 집계로 region 특성(scan, loop, hot read, 순차 write, hot write)을 정한 뒤, 그 특성과 요청 크기·방향으로 segment마다 접근 패턴(P1 순차 read, P2 hot read, P3 loop read, P4 순차 write, P5 hot write, P6 기타)을 판정한다(Region_Classifier, `samon_classifier=1`, 기본. `0`이면 이전의 요청 단위 판정). 판정 결과에 따른 LRU 조작(folio_activate, folio_deactivate, folio_mark_accessed)은 완료 콜백에서 직접 하지 않고 CPU별 큐를 거쳐 kdamond가 프로세스 컨텍스트에서 실행한다. 패턴별 조작 토글(samon_act_p1~p4)의 기본값은 0이다.
 
-적용 방법, 사용법, 파라미터, 검증 상태는 [kernel/README.md](kernel/README.md)에 있다. 현재 설치 빌드(6.8.0-SAMON #12)에서 kernel/verify_samon.sh 37/37 PASS가 보고되었다. 확인한 것은 감지·요청·실행 건수와 회계 등식이며, page의 LRU 상태 변화와 성능 효과는 아직 측정하지 않았다.
+적용 방법, 사용법, 파라미터, 검증 상태, 측정 결과는 [kernel/README.md](kernel/README.md)에 있다. 2026-10-28 빌드에서 kernel/verify_samon.sh 37/37 PASS(요청 단위 판정 기준)였다. Region_Classifier는 fio 단독 시험으로 P1~P4 판정을 확인했다. mixed 워크로드 9개 시나리오(memory.max 2G/1G/512M × CPU 0/50/100%)에서 `samon_loop_protect_mem_pct=25`, `samon_p2_mode=2`로 MGLRU 대비 page cache refault가 23~49% 줄었고 나빠진 지표는 없었다(n=3). 이 두 값은 아직 커널 기본값이 아니다.
 
 ## 구성
 
@@ -19,6 +19,7 @@ SAMON은 Linux 6.8 DAMON의 operations set "saddr"(mm/damon/saddr.c)로 구현�
 | `bench/samon_replay.py` | trace에 패턴 규칙을 오프라인으로 적용하는 참조 모델 (보고서 CLI 미구현) |
 | `bench/tests/` | pytest(hypothesis) 시험과 하네스 셸 시험 |
 | `demo/` | 시연용 라이브 대시보드, 시나리오, PNG 타임라인 (아래 "시연") |
+| `tools/samon/` | `samon` 제어 CLI(터미널)와 웹 제어판: 감시 on/off, 패턴 토글, 파라미터, 성능·자원 비교 ([tools/samon/README.md](tools/samon/README.md)) |
 | `workloads/` | 초기 히트맵용 워크로드 ([workloads/README.md](workloads/README.md)) |
 
 ## 빠른 사용
@@ -29,9 +30,18 @@ echo 1 | sudo tee /sys/kernel/mm/damon/admin/kdamonds/nr_kdamonds
 echo 1 | sudo tee /sys/kernel/mm/damon/admin/kdamonds/0/contexts/nr_contexts
 echo saddr | sudo tee /sys/kernel/mm/damon/admin/kdamonds/0/contexts/0/operations
 echo 1 | sudo tee /sys/kernel/mm/damon/admin/kdamonds/0/contexts/0/targets/nr_targets
+# DAMON target region = 대상 디스크 전체 (비어 있으면 Region_Classifier는 P6만 낸다)
+R=/sys/kernel/mm/damon/admin/kdamonds/0/contexts/0/targets/0/regions
+echo 1 | sudo tee $R/nr_regions; echo 0 | sudo tee $R/0/start
+cat /sys/class/block/sda/size | sudo tee $R/0/end
 echo on | sudo tee /sys/kernel/mm/damon/admin/kdamonds/0/state
 
 sudo cat /sys/kernel/debug/samon/stats
+sudo cat /sys/kernel/debug/samon/regions   # region별 라벨 (직전 집계 주기)
+
+# 또는 CLI / 웹 제어판 (target region을 자동 설정)
+sudo samon            # tools/samon/install.sh로 설치
+sudo samon web
 
 # 기능 검증
 sudo bash kernel/verify_samon.sh -d /var/tmp/samon_verify
@@ -51,7 +61,7 @@ for t in bench/tests/test_samon_bench_*.sh; do bash "$t"; done
 
 ## 시연 (demo/)
 
-debugfs(stats, streams, wb_hist)를 읽는 터미널 대시보드와, 패턴 P1~P6를 차례로 일으키는 시나리오이다. 시연 도구이며 검증이나 성능 측정 근거가 아니다.
+debugfs(stats, streams, wb_hist, regions)를 읽는 터미널 대시보드와(`samon_classifier=1`이면 Stream_Table 패널 대신 region 라벨 패널), 패턴 P1~P6를 차례로 일으키는 시나리오이다. 시연 도구이며 검증이나 성능 측정 근거가 아니다.
 
 ```bash
 # 터미널 1: 라이브 대시보드 (Ctrl-C로 종료). --record로 초당 값을 CSV에 남긴다
