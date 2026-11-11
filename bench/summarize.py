@@ -9,7 +9,7 @@
 mixed에서는 noise = |mean(off2) − mean(off)|를 지표마다 보고하고 모든 비교에 요구한다.
 보조 잡 대역폭(aux_bw_mib)은 hot 잡 지표와 합치지 않고 자기 표(별도 열)에서 같은 판정을 받는다.
 
-이 판정은 유의성 검정이 아니라 선별 규칙이다.
+이 판정은 효과크기 선별 규칙과 Welch t-검정(양측 p<alpha)을 함께 적용한다.
 
 판정 함수(judge)·유효 행 판정(valid)은 순수 함수이다(property test 대상).
 """
@@ -25,7 +25,8 @@ from typing import Mapping, Sequence
 NA = "NA"
 DASH = "—"
 MIN_N = 3          # R12.5: 유효 반복이 이보다 적으면 판정하지 않음
-DEFAULT_K = 2.0    # 부록 A 확정값(제안 2)
+DEFAULT_K = 2.0    # 부록 A 확정값(제안 2): 선별 규칙의 효과크기 문턱
+DEFAULT_ALPHA = 0.05  # Welch t-검정 유의수준(양측). 이 값보다 p가 작아야 "차이 있음"
 
 DIRECTION: dict[str, int] = {  # +1: 증가가 개선, -1: 감소가 개선, 0: 방향 미정 (R12.3)
     "hot_r_iops": +1, "hot_w_iops": +1, "aux_bw_mib": +1, "loop_bw_mib": +1,
@@ -78,7 +79,90 @@ def stdev(xs: Sequence[float]) -> float:
     return statistics.stdev(xs)
 
 
-def judge(xs, bs, k, direction, noise=None, names=("X", "B"), extra_n=()):
+def _betacf(a: float, b: float, x: float) -> float:
+    """정규화 불완전 베타 함수의 연분수 (Lentz 방법)."""
+    MAXIT, EPS, FPMIN = 200, 3.0e-12, 1.0e-300
+    qab, qap, qam = a + b, a + 1.0, a - 1.0
+    c = 1.0
+    d = 1.0 - qab * x / qap
+    if abs(d) < FPMIN:
+        d = FPMIN
+    d = 1.0 / d
+    h = d
+    for m in range(1, MAXIT + 1):
+        m2 = 2 * m
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        if abs(d) < FPMIN:
+            d = FPMIN
+        c = 1.0 + aa / c
+        if abs(c) < FPMIN:
+            c = FPMIN
+        d = 1.0 / d
+        h *= d * c
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        if abs(d) < FPMIN:
+            d = FPMIN
+        c = 1.0 + aa / c
+        if abs(c) < FPMIN:
+            c = FPMIN
+        d = 1.0 / d
+        de = d * c
+        h *= de
+        if abs(de - 1.0) < EPS:
+            break
+    return h
+
+
+def _betai(a: float, b: float, x: float) -> float:
+    """정규화 불완전 베타 함수 I_x(a, b)."""
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    bt = math.exp(math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+                  + a * math.log(x) + b * math.log(1.0 - x))
+    if x < (a + 1.0) / (a + b + 2.0):
+        return bt * _betacf(a, b, x) / a
+    return 1.0 - bt * _betacf(b, a, 1.0 - x) / b
+
+
+def t_sf_twosided(t: float, df: float) -> float:
+    """Student t 분포 양측 꼬리확률 P(|T| > |t|). scipy.stats.t.sf와 일치."""
+    if df <= 0:
+        return float("nan")
+    x = df / (df + t * t)
+    return _betai(df / 2.0, 0.5, x)
+
+
+def welch_ttest(xs: Sequence[float], bs: Sequence[float]):
+    """Welch t-검정. (t, df, 양측 p)를 돌려준다. scipy.stats.ttest_ind(equal_var=False)와 일치.
+
+    분산이 모두 0이면: 평균이 같으면 (0, nx+nb-2, 1.0), 다르면 (inf, nx+nb-2, 0.0).
+    순수 함수(표준 라이브러리만 사용)."""
+    nx, nb = len(xs), len(bs)
+    mx, mb = mean(xs), mean(bs)
+    vx = stdev(xs) ** 2 if nx > 1 else 0.0
+    vb = stdev(bs) ** 2 if nb > 1 else 0.0
+    sx, sb = vx / nx, vb / nb
+    denom = sx + sb
+    if denom == 0.0:
+        if mx == mb:
+            return 0.0, float(nx + nb - 2), 1.0
+        return math.inf, float(nx + nb - 2), 0.0
+    t = (mx - mb) / math.sqrt(denom)
+    # Welch-Satterthwaite 자유도. 분모가 언더플로로 0이 되면(한쪽 분산이 극단적으로 작음)
+    # 큰 자유도로 근사한다(정규근사에 해당).
+    ddf = (sx * sx / (nx - 1)) + (sb * sb / (nb - 1))
+    if ddf <= 0.0:
+        df = float(nx + nb - 2)
+    else:
+        df = denom * denom / ddf
+    return t, df, t_sf_twosided(t, df)
+
+
+def judge(xs, bs, k, direction, noise=None, names=("X", "B"), extra_n=(), alpha=DEFAULT_ALPHA):
     """xs, bs: 유효 반복 값 목록(NA는 None). extra_n: mixed의 (("off2", n_off2),).
     순서: n < 3 검사 → NA 검사 → 식 (둘 다 해당하면 "판정하지 않음")."""
     short = [(nm, len(v)) for nm, v in zip(names, (xs, bs)) if len(v) < MIN_N] + \
@@ -89,7 +173,12 @@ def judge(xs, bs, k, direction, noise=None, names=("X", "B"), extra_n=()):
             (noise is not None and math.isnan(noise)):
         return NA
     d = mean(xs) - mean(bs)
-    diff = abs(d) > k * max(stdev(xs), stdev(bs)) and (noise is None or abs(d) > noise)
+    # 세 조건을 모두 만족해야 "차이 있음": (1) 효과크기 선별, (2) 잡음 초과, (3) Welch t-검정 유의
+    effect = abs(d) > k * max(stdev(xs), stdev(bs))
+    over_noise = noise is None or abs(d) > noise
+    _, _, p = welch_ttest(xs, bs)
+    significant = p < alpha
+    diff = effect and over_noise and significant
     if not diff:
         return "차이 없음"
     if direction == 0:
@@ -244,7 +333,7 @@ def summarize(rows: Sequence[Mapping[str, str]], k: float) -> str:
 
     out.append("---")
     out.append("")
-    out.append("이 판정은 유의성 검정이 아니라 선별 규칙이다.")
+    out.append("이 판정은 효과크기 선별 규칙과 Welch t-검정(양측 p<alpha)을 함께 적용한다.")
     out.append("")
     out.append(f"- k = {k:g}: |mean(X) − mean(B)| > k × max(sd(X), sd(B)) 이면 \"차이 있음\" "
                "(sd 바닥값 없음). mixed는 추가로 |mean(X) − mean(B)| > noise를 요구한다.")
