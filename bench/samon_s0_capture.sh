@@ -219,6 +219,8 @@ if [ "$ATT" != 1 ]; then
 fi
 sleep 1	# BEGIN 출력과 probe 활성화 여유
 echo "trace_start=$(date +%s%N)" >> "$CAP"
+# 시계 기준점: 트레이스 시각(bpftrace nsecs = CLOCK_MONOTONIC)을 실제 시각(realtime)으로 바꿀 때 쓴다
+python3 -c "import time; print(\"clock_ref realtime_ns=%d monotonic_ns=%d\" % (time.time_ns(), time.clock_gettime_ns(time.CLOCK_MONOTONIC)))" >> "$CAP"
 
 # 4. 워크로드 실행
 log "running $W"
