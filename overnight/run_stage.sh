@@ -125,8 +125,10 @@ for b in $(seq 1 "$B"); do
 		want=$((nc * N))
 		OUT="$SD/$W/b$b"
 		if [ -e "$OUT" ]; then
-			if [ "$(rows_of "$OUT")" -ge "$want" ]; then
-				echo "--- skip $W b$b: complete ($(rows_of "$OUT")/$want rows) ---"; RC[$W.b$b]=skip; continue
+			# b<k> 또는 그 재시도 b<k>r<N> 중 하나라도 완료면 건너뛴다 (11/21 수정: 전에는 b<k>만 봤음)
+			full=""; for d in "$OUT" "$OUT"r*; do [ -d "$d" ] && [ "$(rows_of "$d")" -ge "$want" ] && { full=$d; break; }; done
+			if [ -n "$full" ]; then
+				echo "--- skip $W b$b: complete in $(basename "$full") ($(rows_of "$full")/$want rows) ---"; RC[$W.b$b]=skip; continue
 			fi
 			k=2; while [ -e "${OUT}r$k" ]; do k=$((k + 1)); done
 			echo "--- $W b$b incomplete ($(rows_of "$OUT")/$want rows) → retry in b${b}r$k ---"
