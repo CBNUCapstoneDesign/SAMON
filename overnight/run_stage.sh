@@ -82,6 +82,32 @@ out=$(bash -c 'source "$1" >/dev/null 2>&1; DIR=$2
 echo "target: $out"
 case "$out" in OK*) DISK=$(echo "$out" | cut -d' ' -f2) ;; *) echo "FATAL: cannot resolve a single target disk for $DIR"; exit 2 ;; esac
 
+# DAMON target region = 대상 디스크 전체 (kernel/README.md). 비어 있으면 classifier=1 이 아무것도 판정하지 않는다.
+# sysfs 값은 재부팅하면 사라지므로 단계 시작과 블록마다 다시 쓰고 읽어 확인한다 (11/22 추가).
+KDS=/sys/kernel/mm/damon/admin/kdamonds
+set_region() {
+	local R=$KDS/0/contexts/0/targets/0/regions size
+	size=$(cat /sys/class/block/$DISK/size) || { echo "FATAL: cannot read size of $DISK"; exit 2; }
+	[ -d "$KDS/0/contexts/0/targets/0" ] || { echo 1 > $KDS/nr_kdamonds; echo 1 > $KDS/0/contexts/nr_contexts; echo saddr > $KDS/0/contexts/0/operations; echo 1 > $KDS/0/contexts/0/targets/nr_targets; } 2>/dev/null
+	echo 1 > $R/nr_regions && echo 0 > $R/0/start && echo "$size" > $R/0/end || { echo "FATAL: cannot write DAMON target region"; exit 2; }
+	[ "$(cat $R/nr_regions) $(cat $R/0/start) $(cat $R/0/end)" = "1 0 $size" ] || { echo "FATAL: DAMON target region read-back mismatch"; exit 2; }
+	echo "region: $DISK 0-$size sectors"
+}
+# 블록이 끝난 뒤: classifier=1 인데 samon_all 실행의 rgn_nr 이 모두 0 이면 SAMON 이 아무것도 판정하지 않은 것 → 단계 중단
+check_rgn() {
+	[ "$CLS" = 1 ] || return 0
+	local d=$1 st n v any=0 pos=0
+	for st in $(grep -l "^config=samon_all" "$d"/run*.state 2>/dev/null); do
+		n=$(basename "$st" .state); n=${n#run}
+		v=$(sed -n "s/^rgn_nr=//p" "$d/snap_${n}_post/samon_stats" 2>/dev/null); [ -n "$v" ] || continue
+		any=1; [ "$v" -gt 0 ] && pos=1
+	done
+	[ $any = 0 ] && { echo "WARN: rgn check: no samon_all snapshot in $(basename "$d")"; return 0; }
+	[ $pos = 1 ] && { echo "rgn check ok: $(basename "$d")"; return 0; }
+	echo "FATAL: rgn_nr=0 in every samon_all run of $d (classifier saw no DAMON region)"; return 1
+}
+set_region
+
 env_stage() {	# 단계 환경 기록 (보고서 "데이터 수집 방법"용)
 	local tag=$1
 	{
@@ -135,6 +161,7 @@ for b in $(seq 1 "$B"); do
 			OUT="${OUT}r$k"
 		fi
 		mkdir -p "$SD/$W"
+		set_region
 		LIMIT=$(( nc * N * (R + T + 150) ))
 		date +%s > "$SD/HEARTBEAT"
 		echo "--- $W b$b: $nc configs x $N reps, limit ${LIMIT}s, $(date '+%F %T') ---"
@@ -157,6 +184,7 @@ for b in $(seq 1 "$B"); do
 			echo "WARN: no runs.csv for $W $(basename "$OUT")"
 		fi
 		case $rc in 130|143) echo "interrupted: stopping stage"; STOP=1; break ;; esac
+		if [ -z "$RUNBENCH" ] && ! check_rgn "$OUT"; then echo "region check failed: stopping stage"; STOP=1; RGN_FAIL=1; break; fi
 	done
 	[ "$STOP" = 1 ] && break
 done
@@ -173,6 +201,7 @@ if [ -z "$RUNBENCH" ]; then
 	done
 fi
 env_stage end
+if [ "${RGN_FAIL:-0}" = 1 ]; then echo "=== stage $STAGE STOPPED (rgn_nr=0), no DONE written ==="; exit 3; fi
 { echo "stage=$STAGE"; echo "finished=$(date '+%F %T')"; echo "stopped_early=$STOP"
   for k in "${!RC[@]}"; do echo "rc_$k=${RC[$k]}"; done | sort; } > "$SD/DONE"
 echo "=== stage $STAGE done $(date '+%F %T') ==="
