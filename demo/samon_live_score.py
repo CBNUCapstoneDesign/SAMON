@@ -22,6 +22,7 @@ from rich.text import Text
 DBG = "/sys/kernel/debug/samon/stats"
 CG = "/sys/fs/cgroup/samon_live/memory.stat"
 PHASE = "/run/samon_demo/phase"
+RUNNER_PID = "/run/samon_demo/runner.pid"
 PATTERNS = [  # (번호, 이름, 조작) — samon_classifier=1 (Region_Classifier) 기준, kernel/README.md
     (1, "순차 read (scan)", "demote"),
     (2, "hot read", "mark_accessed (p2_mode=2)"),
@@ -95,8 +96,22 @@ class State:
             pass
 
 
+def runner_alive():
+    try:
+        pid = int(open(RUNNER_PID).read().strip())
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
 def header(s):
     name, desc, start = s.phase
+    if not runner_alive():
+        t = Text()
+        t.append(" 워크로드 실행 중 아님 ", style="bold white on dark_red")
+        t.append(f"  실행기(samon_live_ab.sh)가 돌고 있지 않다. 아래 칸 메시지를 확인할 것.  마지막 상태: {name} {desc}")
+        return Panel(t, title="SAMON 라이브 시연 — mixed 워크로드 (10/28 측정 조건)", border_style="red")
     el = ""
     try:
         el = f"{time.time() - float(start):5.0f}초"
@@ -128,6 +143,8 @@ def pattern_panel(s):
         bar = "█" * int(d / mx * 12)
         tb.add_row(f"P{n} {nm}", f"{d:9,.0f} [green]{bar}[/]", f"{e:9,.0f}", act)
     note = "" if on else "\n[dim]SAMON 이 꺼진 단계에서는 판정이 멈춘다 (kdamond off)[/]"
+    if not runner_alive():
+        note = "\n[bold red]실행기가 돌고 있지 않다: 여기 보이는 판정은 시연 워크로드가 아니라 다른 디스크 I/O 다[/]"
     rg = s.prev_st.get("rgn_nr", 0) if s.prev_st else 0
     return Panel(Group(tb, Text.from_markup(f"[dim]현재 DAMON region 라벨 수 rgn_nr={rg}[/]{note}")),
                  title="② SAMON 패턴 판정 (블록 요청 → 영역 라벨 → P1~P6)", border_style="green")

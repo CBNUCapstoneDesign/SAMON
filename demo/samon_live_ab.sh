@@ -7,7 +7,8 @@
 #   SAMON 권장값 samon_loop_protect_mem_pct=25, samon_p2_mode=2, samon_classifier=1, 토글 P1~P4 on (samon_all).
 #
 # usage: sudo bash demo/samon_live_ab.sh [-d DIR] [-m MEM] [-t SECS] [-r RAMP] [-n CYCLES] [-c CPU%] [-o CSV]
-#   -d DIR     작업 파일 위치 (기본 /mnt/samon_bench/work, hot.dat·scan.dat 없으면 만든다)
+#   -d DIR     작업 파일 위치. 없으면 만든다. 기본: /mnt/samon_bench/work 가 있으면 그곳, 없으면 /var/tmp/samon_live_work
+#              hot.dat(1GiB)·scan.dat(2GiB) 가 없으면 처음 실행 때 만든다 (여유 공간 4GiB 이상 필요, tmpfs 불가)
 #   -m MEM     cgroup memory.max (기본 512M)
 #   -t SECS    측정 초 (기본 40)      -r RAMP  ramp 초 (기본 10)
 #   -n CYCLES  사이클 수, 0 = Ctrl-C 까지 계속 (기본 0). 사이클 1개 = MGLRU 1회 + SAMON 1회
@@ -23,7 +24,7 @@ set -u
 cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." || exit 2
 REPO=$PWD
 
-DIR=/mnt/samon_bench/work; MEM=512M; SECS=40; RAMP=10; CYCLES=0; CPU=0
+DIR=""; MEM=512M; SECS=40; RAMP=10; CYCLES=0; CPU=0
 OUT=/var/tmp/samon_live/cycles.csv
 while getopts "d:m:t:r:n:c:o:h" o; do
 	case $o in
@@ -42,16 +43,35 @@ CG=/sys/fs/cgroup/samon_live
 PHASE_DIR=/run/samon_demo; PHASE_FILE=$PHASE_DIR/phase
 WORK=$(dirname "$OUT")
 log() { echo "[$(date +%T)] $*"; }
-die() { echo "FATAL: $*" >&2; exit 2; }
+phase() { mkdir -p "$PHASE_DIR" 2>/dev/null && printf '%s\t%s\t%s\n' "$1" "$2" "$(date +%s.%N)" > "$PHASE_FILE.tmp" && mv -f "$PHASE_FILE.tmp" "$PHASE_FILE"; }
+die() { echo "FATAL: $*" >&2; phase "오류" "$*  (아래 칸 메시지 확인)"; rm -f "$PHASE_DIR/runner.pid"; exit 2; }
 
 # shellcheck source=/dev/null
 . "$REPO/bench/samon_workloads.sh" || die "bench/samon_workloads.sh 를 읽지 못함"
 mkdir -p "$WORK" "$PHASE_DIR" && chmod 755 "$PHASE_DIR" || die "cannot create $WORK / $PHASE_DIR"
-[ -d "$DIR" ] || die "작업 디렉터리 없음: $DIR"
-for f in "hot.dat 1G" "scan.dat 2G"; do
+echo $$ > "$PHASE_DIR/runner.pid"     # 화면(samon_live_score.py)이 실행기가 살아 있는지 확인하는 데 쓴다
+if [ -z "$DIR" ]; then
+	DIR=/var/tmp/samon_live_work; [ -d /mnt/samon_bench/work ] && DIR=/mnt/samon_bench/work
+fi
+mkdir -p "$DIR" || die "작업 디렉터리를 만들 수 없음: $DIR"
+[ "$(findmnt -no FSTYPE --target "$DIR")" != tmpfs ] || die "$DIR 는 tmpfs(메모리)라 쓸 수 없음. 디스크 위 경로를 -d 로 지정"
+need=0
+for f in "hot.dat 1073741824" "scan.dat 2147483648"; do
 	set -- $f
-	[ -s "$DIR/$1" ] || { log "준비: $DIR/$1 ($2) 생성"; swl_prefill_file "$DIR/$1" "$2" || die "prefill $1 실패"; }
+	[ "$(stat -c %s "$DIR/$1" 2>/dev/null || echo 0)" -ge "$2" ] || need=$((need + $2))
 done
+if [ "$need" -gt 0 ]; then
+	avail=$(( $(df --output=avail -B1 "$DIR" | tail -1) ))
+	[ "$avail" -ge $((need + 1073741824)) ] ||
+		die "여유 공간 부족: $DIR 에 $((need / 1048576))MiB 를 만들어야 하는데 여유 $((avail / 1048576))MiB (1GiB 여유 포함 필요)"
+	phase "준비" "작업 파일 생성 중 ($((need / 1048576))MiB, 처음 한 번만) — $DIR"
+	for f in "hot.dat 1G 1073741824" "scan.dat 2G 2147483648"; do
+		set -- $f
+		[ "$(stat -c %s "$DIR/$1" 2>/dev/null || echo 0)" -ge "$3" ] && continue
+		log "준비: $DIR/$1 ($2) 생성"; rm -f "$DIR/$1"
+		swl_prefill_file "$DIR/$1" "$2" || die "작업 파일 생성 실패: $DIR/$1"
+	done
+fi
 
 # 대상 디스크 (DIR 이 있는 파티션의 상위 디스크)
 src=$(findmnt -no SOURCE --target "$DIR") || die "findmnt 실패"
@@ -76,7 +96,7 @@ restore() {
 	for p in $PNAMES; do echo "${SAVED[$p]}" > "$PARM/$p" 2>/dev/null; done
 	[ "$SAVED_KD" = on ] && echo on > "$KD/0/state" 2>/dev/null
 	echo "$SAVED_LS" > "$LRUP/enabled" 2>/dev/null
-	printf '%s\t%s\t%s\n' "종료" "시연 끝" "$(date +%s.%N)" > "$PHASE_FILE"
+	phase "종료" "시연 끝 (실행기 종료)"; rm -f "$PHASE_DIR/runner.pid"
 	exit 0
 }
 trap restore EXIT INT TERM
@@ -100,7 +120,7 @@ echo 5000 > "$A/sample_us"; echo 100000 > "$A/aggr_us"; echo 1000000 > "$A/updat
 setp samon_q_len 8192; setp samon_loop_protect_mem_pct 25; setp samon_p2_mode 2; setp samon_classifier 1
 setp samon_dbg_lba 0; setp samon_dev_major "$DMAJ"; setp samon_dev_minor "$DMIN"
 for i in 1 2 3 4; do setp "samon_act_p$i" 1; done; setp samon_opt_b 0
-log "대상 디스크 $DISK ($DMAJ:$DMIN, region 0-$DSIZE), memory.max=$MEM, ${RAMP}s ramp + ${SECS}s 측정"
+log "작업 디렉터리 $DIR, 대상 디스크 $DISK ($DMAJ:$DMIN, region 0-$DSIZE), memory.max=$MEM, ${RAMP}s ramp + ${SECS}s 측정"
 
 if [ "$CPU" -gt 0 ] 2>/dev/null; then
 	stress-ng --cpu "$(nproc)" --cpu-load "$CPU" --quiet & STRESS_PID=$!
